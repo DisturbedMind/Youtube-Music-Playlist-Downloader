@@ -1,0 +1,17 @@
+{
+  "url": "",
+  "output_dir": "C:\\Users\\rudi\\Downloads\\YouTube Music",
+  "format": "FLAC",
+  "cookies_mode": "cookies.txt file",
+  "cookies_file": "C:\\Users\\rudi\\Documents\\Youtube Music Playlist Downloader\\youtube-cookies.txt",
+  "extract_browser": "Firefox",
+  "sleep_min": 3.0,
+  "sleep_max": 8.0,
+  "js_runtime": "deno,node",
+  "remote_components": "ejs:github",
+  "embed_metadata": true,
+  "skip_downloaded": true,
+  "queue": [
+    "https://music.youtube.com/playlist?list=PLEYAPNn8uxoMTWIN7AriGp4z5Bj01WSfZ&si=cqdzBZZwui5rDnYC"
+  ]
+}
