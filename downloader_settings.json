@@ -12,5 +12,7 @@
   "embed_metadata": true,
   "normalize_audio": true,
   "skip_downloaded": true,
-  "queue": []
+  "queue": [
+    "https://music.youtube.com/playlist?list=OLAK5uy_nTBlisBQsR8EokNKozP3lJ_nBnUt61o3U&si=qUgxppkznth8rOY7"
+  ]
 }
