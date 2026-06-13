@@ -149,7 +149,7 @@ Normal playlists create a subfolder named after the playlist. The file extension
 002 - Track Title.mp3
 ```
 
-Albums are grouped by album artist first, then album title:
+YouTube Music albums are downloaded to a temporary staging folder first. After conversion, the app reads the finished audio file tags, groups albums by album artist first, then album title, and cleans the staging area after a successful album download:
 
 ```text
 Album Artist

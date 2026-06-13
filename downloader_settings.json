@@ -10,6 +10,7 @@
   "js_runtime": "deno,node",
   "remote_components": "ejs:github",
   "embed_metadata": true,
+  "normalize_audio": true,
   "skip_downloaded": true,
   "queue": []
 }

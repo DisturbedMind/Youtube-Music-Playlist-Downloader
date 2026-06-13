@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import traceback
 import time
@@ -34,6 +35,8 @@ LOUDNESS_NORMALIZE_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
 DEFAULT_SLEEP_MIN = "3"
 DEFAULT_SLEEP_MAX = "8"
 DEFAULT_REMOTE_COMPONENTS = "ejs:github"
+AUDIO_SUFFIXES = {".flac", ".mp3"}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 class DownloadCancelled(Exception):
@@ -191,6 +194,14 @@ def clean_playlist_folder_label(value: object) -> str:
     return text or "YouTube Music Playlist"
 
 
+def clean_artist_folder_label(value: object) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"\s+-\s+Topic$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+Topic$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    return text or "Unknown Artist"
+
+
 def sanitize_windows_folder_name(value: object, fallback: str = "YouTube Music Playlist") -> str:
     text = clean_playlist_folder_label(value)
     text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text)
@@ -231,6 +242,15 @@ def fallback_playlist_folder_name(url: str) -> str:
     if match:
         return sanitize_windows_folder_name(f"YouTube Music {match.group(1)}")
     return "YouTube Music Playlist"
+
+
+def playlist_id_from_url(url: str) -> str:
+    match = re.search(r"[?&]list=([^&]+)", url)
+    return match.group(1) if match else ""
+
+
+def is_youtube_music_album_playlist(url: str) -> bool:
+    return playlist_id_from_url(url).upper().startswith("OLAK")
 
 
 def metadata_text(value: object) -> str:
@@ -292,9 +312,11 @@ def most_common_entry_metadata_candidate(info: dict[str, object], keys: tuple[st
 
     counter: Counter[str] = Counter()
     original: dict[str, str] = {}
+    usable_entries = 0
     for entry in entries[:12]:
         if not isinstance(entry, dict):
             continue
+        usable_entries += 1
         for key in keys:
             text = metadata_text(entry.get(key))
             if not text or is_generic_metadata_name(text):
@@ -306,9 +328,13 @@ def most_common_entry_metadata_candidate(info: dict[str, object], keys: tuple[st
     if not counter:
         return ""
     key, count = counter.most_common(1)[0]
-    if min_ratio > 0 and count / max(len(entries[:12]), 1) < min_ratio:
+    if min_ratio > 0 and count / max(usable_entries, 1) < min_ratio:
         return ""
     return original[key]
+
+
+def same_metadata_label(left: object, right: object) -> bool:
+    return clean_playlist_folder_label(left).casefold() == clean_playlist_folder_label(right).casefold()
 
 
 def looks_like_album(info: dict[str, object], raw_title: object) -> bool:
@@ -321,24 +347,31 @@ def looks_like_album(info: dict[str, object], raw_title: object) -> bool:
     if playlist_type == "album":
         return True
     common_album = most_common_entry_metadata_candidate(info, ("album", "album_title"), min_ratio=0.75)
-    return bool(common_album and clean_playlist_folder_label(common_album).casefold() == clean_playlist_folder_label(raw_title).casefold())
+    clean_title = clean_playlist_folder_label(raw_title)
+    return bool(common_album and (same_metadata_label(common_album, raw_title) or clean_title.casefold().endswith(clean_playlist_folder_label(common_album).casefold())))
+
+
+def album_folder_parts_from_info(info: dict[str, object], raw_title: object) -> tuple[str, str]:
+    album_title = (
+        most_common_entry_metadata_candidate(info, ("album", "album_title"), min_ratio=0.5)
+        or top_level_metadata_candidate(info, ("album", "album_title"))
+        or clean_playlist_folder_label(raw_title)
+    )
+    artist = (
+        most_common_entry_metadata_candidate(info, ("album_artist", "album_artists"), min_ratio=0.5)
+        or top_level_metadata_candidate(info, ("album_artist", "album_artists"))
+        or most_common_entry_metadata_candidate(info, ("artist", "artists"), min_ratio=0.5)
+        or most_common_entry_metadata_candidate(info, ("creator", "channel", "uploader"), min_ratio=0.5)
+        or top_level_metadata_candidate(info, ("artist", "artists", "creator", "channel", "uploader"))
+    )
+    return clean_artist_folder_label(artist), clean_playlist_folder_label(album_title)
 
 
 def output_folder_from_playlist_info(info: dict[str, object], url: str) -> Path:
     raw_title = info.get("playlist_title") or info.get("title") or info.get("album") or fallback_playlist_folder_name(url)
-    album_title = (
-        first_metadata_candidate(info, ("album", "album_title"))
-        or most_common_entry_metadata_candidate(info, ("album", "album_title"))
-        or clean_playlist_folder_label(raw_title)
-    )
 
     if looks_like_album(info, raw_title):
-        artist = (
-            first_metadata_candidate(info, ("album_artist", "album_artists"))
-            or most_common_entry_metadata_candidate(info, ("album_artist", "album_artists"))
-            or most_common_entry_metadata_candidate(info, ("artist", "artists", "creator", "channel", "uploader"))
-            or first_metadata_candidate(info, ("artist", "artists", "creator", "channel", "uploader"))
-        )
+        artist, album_title = album_folder_parts_from_info(info, raw_title)
         artist_folder = sanitize_windows_folder_name(artist or "Unknown Artist", fallback="Unknown Artist")
         album_folder = sanitize_windows_folder_name(album_title, fallback="Unknown Album")
         return Path(artist_folder) / album_folder
@@ -346,11 +379,25 @@ def output_folder_from_playlist_info(info: dict[str, object], url: str) -> Path:
     return Path(sanitize_windows_folder_name(raw_title))
 
 
-def build_metadata_probe_options(opts: dict[str, object], *, full: bool) -> dict[str, object]:
+def build_metadata_probe_options(opts: dict[str, object], *, full: bool, temp_dir: Path) -> dict[str, object]:
     probe_opts = dict(opts)
-    for key in ("outtmpl", "progress_hooks", "postprocessors", "download_archive"):
+    for key in ("outtmpl", "paths", "progress_hooks", "postprocessors", "postprocessor_args", "download_archive"):
         probe_opts.pop(key, None)
-    probe_opts.update({"quiet": True, "noprogress": True, "skip_download": True})
+    probe_opts.update(
+        {
+            "quiet": True,
+            "noprogress": True,
+            "skip_download": True,
+            "writethumbnail": False,
+            "write_all_thumbnails": False,
+            "writeinfojson": False,
+            "writedescription": False,
+            "writesubtitles": False,
+            "writeautomaticsub": False,
+            "outtmpl": str(temp_dir / "%(id)s.%(ext)s"),
+            "paths": {"home": str(temp_dir), "temp": str(temp_dir)},
+        }
+    )
     if full:
         probe_opts.pop("extract_flat", None)
         probe_opts["playlist_items"] = "1:8"
@@ -372,6 +419,191 @@ def merge_playlist_metadata(base: dict[str, object], rich: dict[str, object]) ->
     return merged
 
 
+def cleanup_leftover_thumbnail_files(folder: Path, messages: object) -> None:
+    if not folder.exists() or not folder.is_dir():
+        return
+    removed = 0
+    for path in folder.iterdir():
+        if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except OSError as exc:
+            messages.put(("log", f"Could not remove leftover cover image {path.name}: {exc}"))
+    if removed:
+        messages.put(("log", f"Removed {removed} leftover cover image file(s)."))
+
+
+def snapshot_image_files(root: Path) -> set[Path]:
+    if not root.exists():
+        return set()
+    return {path.resolve() for path in root.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES}
+
+
+def cleanup_new_thumbnail_files(root: Path, before: set[Path], messages: object) -> None:
+    if not root.exists():
+        return
+    removed = 0
+    for path in snapshot_image_files(root):
+        if path in before:
+            continue
+        try:
+            path.unlink()
+            removed += 1
+        except OSError as exc:
+            messages.put(("log", f"Could not remove leftover cover image {path.name}: {exc}"))
+    if removed:
+        messages.put(("log", f"Removed {removed} leftover cover image file(s)."))
+
+
+def album_staging_folder(output_dir: Path, url: str) -> Path:
+    playlist_id = playlist_id_from_url(url) or "album"
+    folder = sanitize_windows_folder_name(playlist_id, fallback="album")
+    return output_dir / "_staging" / folder
+
+
+def tag_values_from_audio_file(path: Path, keys: tuple[str, ...]) -> list[str]:
+    try:
+        from mutagen import File as MutagenFile
+    except Exception:
+        return []
+
+    try:
+        audio = MutagenFile(path, easy=True)
+    except Exception:
+        try:
+            audio = MutagenFile(path)
+        except Exception:
+            return []
+
+    tags = getattr(audio, "tags", None)
+    if not tags:
+        return []
+
+    values: list[str] = []
+    for key in keys:
+        possible_keys = {key, key.lower(), key.replace("_", ""), key.replace("_", " ")}
+        for possible_key in possible_keys:
+            try:
+                raw_value = tags.get(possible_key)
+            except Exception:
+                raw_value = None
+            if raw_value is None:
+                continue
+            if isinstance(raw_value, (list, tuple)):
+                for item in raw_value:
+                    text = metadata_text(item)
+                    if text:
+                        values.append(text)
+            else:
+                text = metadata_text(raw_value)
+                if text:
+                    values.append(text)
+    return values
+
+
+def most_common_metadata_value(paths: list[Path], keys: tuple[str, ...]) -> str:
+    counter: Counter[str] = Counter()
+    original: dict[str, str] = {}
+    for path in paths:
+        for value in tag_values_from_audio_file(path, keys):
+            if not value or is_generic_metadata_name(value):
+                continue
+            normalized = value.casefold()
+            counter[normalized] += 1
+            original.setdefault(normalized, value)
+
+    if not counter:
+        return ""
+    key = counter.most_common(1)[0][0]
+    return original[key]
+
+
+def unique_destination_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for index in range(1, 1000):
+        candidate = path.with_name(f"{path.stem} ({index}){path.suffix}")
+        if not candidate.exists():
+            return candidate
+    return path.with_name(f"{path.stem} ({int(time.time())}){path.suffix}")
+
+
+def cleanup_album_staging_area(staging_dir: Path, messages: object, *, remove_non_audio: bool) -> None:
+    if not staging_dir.exists():
+        return
+
+    removed = 0
+    if remove_non_audio:
+        for path in sorted(staging_dir.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+            if not path.is_file() or path.suffix.lower() in AUDIO_SUFFIXES:
+                continue
+            try:
+                path.unlink()
+                removed += 1
+            except OSError as exc:
+                messages.put(("log", f"Could not remove staging leftover {path.name}: {exc}"))
+
+    audio_left = [path for path in staging_dir.rglob("*") if path.is_file() and path.suffix.lower() in AUDIO_SUFFIXES]
+    for folder in sorted((path for path in staging_dir.rglob("*") if path.is_dir()), key=lambda item: len(item.parts), reverse=True):
+        try:
+            folder.rmdir()
+        except OSError:
+            pass
+    try:
+        staging_dir.rmdir()
+    except OSError:
+        pass
+    try:
+        staging_dir.parent.rmdir()
+    except OSError:
+        pass
+
+    if removed:
+        messages.put(("log", f"Removed {removed} staging leftover file(s)."))
+    if not staging_dir.exists():
+        messages.put(("log", "Cleaned album staging area."))
+    elif audio_left:
+        messages.put(("log", f"Kept album staging area because {len(audio_left)} audio file(s) still need attention."))
+
+
+def organize_album_files_from_audio_tags(staging_dir: Path, output_dir: Path, messages: object) -> Path | None:
+    if not staging_dir.exists():
+        return None
+
+    audio_files = sorted(path for path in staging_dir.rglob("*") if path.is_file() and path.suffix.lower() in AUDIO_SUFFIXES)
+    if not audio_files:
+        messages.put(("log", "Album staging folder did not contain converted audio files to organize."))
+        cleanup_album_staging_area(staging_dir, messages, remove_non_audio=True)
+        return None
+
+    artist = most_common_metadata_value(
+        audio_files,
+        ("albumartist", "album_artist", "album artist", "artist", "artists", "performer"),
+    )
+    album = most_common_metadata_value(audio_files, ("album", "albumtitle", "album_title", "album title"))
+
+    artist_folder = sanitize_windows_folder_name(clean_artist_folder_label(artist), fallback="Unknown Artist")
+    album_folder = sanitize_windows_folder_name(clean_playlist_folder_label(album), fallback="Unknown Album")
+    destination_dir = output_dir / artist_folder / album_folder
+    destination_dir.mkdir(parents=True, exist_ok=True)
+
+    moved = 0
+    for source in audio_files:
+        destination = unique_destination_path(destination_dir / source.name)
+        try:
+            source.replace(destination)
+            moved += 1
+        except OSError as exc:
+            messages.put(("log", f"Could not move {source.name} into album folder: {exc}"))
+
+    cleanup_album_staging_area(staging_dir, messages, remove_non_audio=True)
+    messages.put(("log", f"Album folder from audio tags: {artist_folder}\\{album_folder}"))
+    messages.put(("log", f"Moved {moved} album track(s) into {artist_folder}\\{album_folder}."))
+    return destination_dir
+
+
 def resolve_playlist_output_folder(
     ydl_module: object,
     opts: dict[str, object],
@@ -382,19 +614,26 @@ def resolve_playlist_output_folder(
     if stop_event.is_set():
         raise DownloadCancelled("Download stopped by user")
 
-    try:
-        with ydl_module.YoutubeDL(build_metadata_probe_options(opts, full=False)) as ydl:
-            info = ydl.extract_info(url, download=False, process=False) or {}
-    except Exception as exc:
-        messages.put(("log", f"Could not pre-read playlist title; using a safe folder name instead: {exc}"))
-        return Path(fallback_playlist_folder_name(url))
+    with tempfile.TemporaryDirectory(prefix="ytmusic-probe-") as probe_dir_text:
+        probe_dir = Path(probe_dir_text)
+        try:
+            with ydl_module.YoutubeDL(build_metadata_probe_options(opts, full=False, temp_dir=probe_dir)) as ydl:
+                info = ydl.extract_info(url, download=False, process=False) or {}
+        except Exception as exc:
+            messages.put(("log", f"Could not pre-read playlist title; using a safe folder name instead: {exc}"))
+            return Path(fallback_playlist_folder_name(url))
 
-    try:
-        with ydl_module.YoutubeDL(build_metadata_probe_options(opts, full=True)) as ydl:
-            rich_info = ydl.extract_info(url, download=False, process=True) or {}
-        info = merge_playlist_metadata(info, rich_info)
-    except Exception as exc:
-        messages.put(("log", f"Could not read full song metadata for album artist; using playlist metadata instead: {exc}"))
+        try:
+            with ydl_module.YoutubeDL(build_metadata_probe_options(opts, full=True, temp_dir=probe_dir)) as ydl:
+                rich_info = ydl.extract_info(url, download=False, process=True) or {}
+            info = merge_playlist_metadata(info, rich_info)
+        except Exception as exc:
+            messages.put(("log", f"Could not read full song metadata for album artist; using playlist metadata instead: {exc}"))
+
+    raw_title = info.get("playlist_title") or info.get("title") or info.get("album") or fallback_playlist_folder_name(url)
+    if looks_like_album(info, raw_title):
+        artist, album_title = album_folder_parts_from_info(info, raw_title)
+        messages.put(("log", f"Album metadata: artist={artist or 'Unknown Artist'}; album={album_title or 'Unknown Album'}"))
 
     folder = output_folder_from_playlist_info(info, url)
     messages.put(("log", f"Download folder: {folder}"))
@@ -616,6 +855,14 @@ def build_ydl_options(
     return options
 
 
+def ensure_album_metadata_postprocessor(options: dict[str, object]) -> None:
+    postprocessors = list(options.get("postprocessors") or [])
+    keys = {str(postprocessor.get("key") or "") for postprocessor in postprocessors if isinstance(postprocessor, dict)}
+    if "FFmpegMetadata" not in keys:
+        postprocessors.append({"key": "FFmpegMetadata", "add_chapters": True})
+        options["postprocessors"] = postprocessors
+
+
 def queue_worker_process(
     targets: list[dict[str, str]],
     output_dir_text: str,
@@ -660,10 +907,30 @@ def queue_worker_process(
                 stop_event=stop_event,
             )
 
+            playlist_output_dir: Path | None = None
+            album_staging_dir: Path | None = None
+            image_snapshot = snapshot_image_files(output_dir)
             try:
-                playlist_folder = resolve_playlist_output_folder(yt_dlp, options, url, messages, stop_event)
-                options["outtmpl"] = str(output_dir / playlist_folder / "%(playlist_index)03d - %(title).180B.%(ext)s")
+                if is_youtube_music_album_playlist(url):
+                    album_staging_dir = album_staging_folder(output_dir, url)
+                    playlist_output_dir = album_staging_dir
+                    ensure_album_metadata_postprocessor(options)
+                    options["outtmpl"] = str(album_staging_dir / "%(playlist_index)03d - %(title).180B.%(ext)s")
+                    messages.put(("log", "Album playlist detected; downloading to staging before reading audio tags."))
+                else:
+                    playlist_folder = resolve_playlist_output_folder(yt_dlp, options, url, messages, stop_event)
+                    playlist_output_dir = output_dir / playlist_folder
+                    options["outtmpl"] = str(playlist_output_dir / "%(playlist_index)03d - %(title).180B.%(ext)s")
                 result = run_ydl_download_with_retries(yt_dlp, options, url, messages, stop_event)
+                if playlist_output_dir is not None:
+                    cleanup_leftover_thumbnail_files(playlist_output_dir, messages)
+                if album_staging_dir is not None and result == 0:
+                    final_album_dir = organize_album_files_from_audio_tags(album_staging_dir, output_dir, messages)
+                    if final_album_dir is not None:
+                        cleanup_leftover_thumbnail_files(final_album_dir, messages)
+                elif album_staging_dir is not None:
+                    cleanup_album_staging_area(album_staging_dir, messages, remove_non_audio=False)
+                cleanup_new_thumbnail_files(output_dir, image_snapshot, messages)
             except DownloadCancelled:
                 detail = "Killed; partial files can resume" if kill_event.is_set() else "Partial files can resume"
                 message = "Queue killed. Partial files can be resumed later." if kill_event.is_set() else "Queue stopped by user. Partial files can be resumed later."
@@ -671,6 +938,9 @@ def queue_worker_process(
                 messages.put(("done", message))
                 return
             except Exception as exc:
+                if playlist_output_dir is not None:
+                    cleanup_leftover_thumbnail_files(playlist_output_dir, messages)
+                cleanup_new_thumbnail_files(output_dir, image_snapshot, messages)
                 failed += 1
                 messages.put(("log", traceback.format_exc()))
                 messages.put(("queue_status", {"id": item_id, "status": "Failed", "detail": str(exc)[:160]}))
@@ -1519,10 +1789,30 @@ class DownloaderApp:
                     stop_event=self.stop_event,
                 )
 
+                playlist_output_dir: Path | None = None
+                album_staging_dir: Path | None = None
+                image_snapshot = snapshot_image_files(output_dir)
                 try:
-                    playlist_folder = resolve_playlist_output_folder(yt_dlp, options, url, self.messages, self.stop_event)
-                    options["outtmpl"] = str(output_dir / playlist_folder / "%(playlist_index)03d - %(title).180B.%(ext)s")
+                    if is_youtube_music_album_playlist(url):
+                        album_staging_dir = album_staging_folder(output_dir, url)
+                        playlist_output_dir = album_staging_dir
+                        ensure_album_metadata_postprocessor(options)
+                        options["outtmpl"] = str(album_staging_dir / "%(playlist_index)03d - %(title).180B.%(ext)s")
+                        self.messages.put(("log", "Album playlist detected; downloading to staging before reading audio tags."))
+                    else:
+                        playlist_folder = resolve_playlist_output_folder(yt_dlp, options, url, self.messages, self.stop_event)
+                        playlist_output_dir = output_dir / playlist_folder
+                        options["outtmpl"] = str(playlist_output_dir / "%(playlist_index)03d - %(title).180B.%(ext)s")
                     result = run_ydl_download_with_retries(yt_dlp, options, url, self.messages, self.stop_event)
+                    if playlist_output_dir is not None:
+                        cleanup_leftover_thumbnail_files(playlist_output_dir, self.messages)
+                    if album_staging_dir is not None and result == 0:
+                        final_album_dir = organize_album_files_from_audio_tags(album_staging_dir, output_dir, self.messages)
+                        if final_album_dir is not None:
+                            cleanup_leftover_thumbnail_files(final_album_dir, self.messages)
+                    elif album_staging_dir is not None:
+                        cleanup_album_staging_area(album_staging_dir, self.messages, remove_non_audio=False)
+                    cleanup_new_thumbnail_files(output_dir, image_snapshot, self.messages)
                 except DownloadCancelled:
                     detail = "Killed; partial files can resume" if self.kill_event.is_set() else "Partial files can resume"
                     message = "Queue killed. Partial files can be resumed later." if self.kill_event.is_set() else "Queue stopped by user. Partial files can be resumed later."
@@ -1530,6 +1820,9 @@ class DownloaderApp:
                     self.messages.put(("done", message))
                     return
                 except Exception as exc:
+                    if playlist_output_dir is not None:
+                        cleanup_leftover_thumbnail_files(playlist_output_dir, self.messages)
+                    cleanup_new_thumbnail_files(output_dir, image_snapshot, self.messages)
                     failed += 1
                     self.messages.put(("log", traceback.format_exc()))
                     self.messages.put(("queue_status", {"id": item_id, "status": "Failed", "detail": str(exc)[:160]}))

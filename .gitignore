@@ -6,3 +6,6 @@ dist/
 *.spec
 downloader_settings.json
 youtube-cookies.txt
+*.jpg
+*.jpeg
+*.webp
