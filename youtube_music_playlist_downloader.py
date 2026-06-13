@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import multiprocessing
 import queue
 import re
 import shutil
@@ -10,6 +11,8 @@ import subprocess
 import sys
 import threading
 import traceback
+import time
+from collections import Counter
 from pathlib import Path
 import tkinter as tk
 from tkinter import BooleanVar, StringVar, Tk, filedialog, messagebox
@@ -18,12 +21,16 @@ from tkinter import ttk
 
 APP_TITLE = "YouTube Music Playlist Downloader"
 SCRIPT_DIR = Path(__file__).resolve().parent
-CONFIG_FILE = SCRIPT_DIR / "downloader_settings.json"
-INSTALLER_PATH = SCRIPT_DIR / "install.ps1"
-LOGO_PATH = SCRIPT_DIR / "assets" / "wolf-banner.png"
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else SCRIPT_DIR
+RESOURCE_DIR = Path(getattr(sys, "_MEIPASS", SCRIPT_DIR))
+CONFIG_FILE = APP_DIR / "downloader_settings.json"
+INSTALLER_PATH = APP_DIR / "install.ps1"
+LOGO_PATH = RESOURCE_DIR / "assets" / "wolf-banner.png"
 DEFAULT_OUTPUT = Path.home() / "Downloads" / "YouTube Music"
-DEFAULT_COOKIES_FILE = SCRIPT_DIR / "youtube-cookies.txt"
+DEFAULT_COOKIES_FILE = APP_DIR / "youtube-cookies.txt"
 DEFAULT_FORMAT = "FLAC"
+FORMAT_CHOICES = ("FLAC", "MP3")
+LOUDNESS_NORMALIZE_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
 DEFAULT_SLEEP_MIN = "3"
 DEFAULT_SLEEP_MAX = "8"
 DEFAULT_REMOTE_COMPONENTS = "ejs:github"
@@ -40,21 +47,26 @@ class QueueLogger:
     def debug(self, msg: str) -> None:
         if msg.startswith("[debug]"):
             return
-        self.messages.put(("log", msg))
+        self.messages.put(("log", strip_ansi(msg)))
 
     def info(self, msg: str) -> None:
-        self.messages.put(("log", msg))
+        self.messages.put(("log", strip_ansi(msg)))
 
     def warning(self, msg: str) -> None:
-        self.messages.put(("log", f"WARNING: {msg}"))
+        self.messages.put(("log", f"WARNING: {strip_ansi(msg)}"))
 
     def error(self, msg: str) -> None:
-        self.messages.put(("log", f"ERROR: {msg}"))
+        self.messages.put(("log", f"ERROR: {strip_ansi(msg)}"))
 
 
 def strip_ansi(value: object) -> str:
     text = str(value or "")
     return re.sub(r"\x1b\[[0-9;]*m", "", text).strip()
+
+
+def normalize_audio_format(value: object) -> str:
+    text = str(value or "").strip().upper()
+    return text if text in FORMAT_CHOICES else DEFAULT_FORMAT
 
 
 def load_config() -> dict[str, object]:
@@ -134,6 +146,34 @@ def is_cookie_decrypt_error(exc: Exception) -> bool:
     return "dpapi" in message or "failed to decrypt" in message or "could not copy chrome cookie database" in message
 
 
+def cookie_decrypt_help(browser: str) -> str:
+    browser_name = browser.title() if browser else "Browser"
+    return (
+        f"{browser_name} cookie extraction failed because Windows DPAPI could not decrypt the browser cookies.\n"
+        "This usually happens when the app is run as Administrator or as a different Windows user than the one that uses the browser.\n"
+        "Closing the browser helps only when the downloader is running under that same Windows account.\n\n"
+        "Try this:\n"
+        "1. Close the browser completely.\n"
+        "2. Start this downloader normally from the same Windows account that is logged into YouTube Music. Do not use Run as administrator.\n"
+        "3. Try Extract Cookies again.\n\n"
+        "If Chrome, Edge, Brave, Opera, or Vivaldi still fail, install Firefox, sign into YouTube Music in Firefox, then extract cookies from Firefox.\n"
+        "Firefox is usually more reliable for this because it does not depend on the same Chromium DPAPI cookie decryption path.\n\n"
+        "You can also use a cookies.txt browser extension/export tool, then choose 'cookies.txt file' in the cookie mode dropdown."
+    )
+
+
+def browser_process_names(browser: str) -> list[str]:
+    processes = {
+        "edge": ["msedge.exe"],
+        "chrome": ["chrome.exe"],
+        "brave": ["brave.exe"],
+        "opera": ["opera.exe", "opera_gx.exe"],
+        "vivaldi": ["vivaldi.exe"],
+        "firefox": ["firefox.exe"],
+    }
+    return processes.get(browser.strip().lower(), [])
+
+
 def is_forbidden_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return "403" in message or "forbidden" in message
@@ -142,6 +182,223 @@ def is_forbidden_error(exc: Exception) -> bool:
 def is_ejs_challenge_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return "n challenge" in message or "challenge solver" in message or "javascript runtime" in message
+
+
+def clean_playlist_folder_label(value: object) -> str:
+    text = str(value or "").strip()
+    text = re.sub(r"^\s*album\s*[-:]+\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    return text or "YouTube Music Playlist"
+
+
+def sanitize_windows_folder_name(value: object, fallback: str = "YouTube Music Playlist") -> str:
+    text = clean_playlist_folder_label(value)
+    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", text)
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    if not text:
+        text = fallback
+    reserved = {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        "COM1",
+        "COM2",
+        "COM3",
+        "COM4",
+        "COM5",
+        "COM6",
+        "COM7",
+        "COM8",
+        "COM9",
+        "LPT1",
+        "LPT2",
+        "LPT3",
+        "LPT4",
+        "LPT5",
+        "LPT6",
+        "LPT7",
+        "LPT8",
+        "LPT9",
+    }
+    if text.upper() in reserved:
+        text = f"{text}_"
+    return text[:180].strip(" .") or fallback
+
+
+def fallback_playlist_folder_name(url: str) -> str:
+    match = re.search(r"[?&]list=([^&]+)", url)
+    if match:
+        return sanitize_windows_folder_name(f"YouTube Music {match.group(1)}")
+    return "YouTube Music Playlist"
+
+
+def metadata_text(value: object) -> str:
+    if isinstance(value, dict):
+        for key in ("name", "title", "id"):
+            text = str(value.get(key) or "").strip()
+            if text:
+                return text
+        return ""
+    if isinstance(value, (list, tuple)):
+        parts = [metadata_text(item) for item in value]
+        return ", ".join(part for part in parts if part)
+    return str(value or "").strip()
+
+
+def metadata_candidates(info: dict[str, object], keys: tuple[str, ...]) -> list[str]:
+    candidates: list[str] = []
+    for key in keys:
+        text = metadata_text(info.get(key))
+        if text:
+            candidates.append(text)
+
+    entries = info.get("entries")
+    if isinstance(entries, list):
+        for entry in entries[:12]:
+            if not isinstance(entry, dict):
+                continue
+            for key in keys:
+                text = metadata_text(entry.get(key))
+                if text:
+                    candidates.append(text)
+
+    return candidates
+
+
+def is_generic_metadata_name(value: str) -> bool:
+    return value.strip().lower() in {"youtube", "youtube music", "music", "various artists", "various"}
+
+
+def first_metadata_candidate(info: dict[str, object], keys: tuple[str, ...]) -> str:
+    for candidate in metadata_candidates(info, keys):
+        if candidate and not is_generic_metadata_name(candidate):
+            return candidate
+    return ""
+
+
+def top_level_metadata_candidate(info: dict[str, object], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        text = metadata_text(info.get(key))
+        if text and not is_generic_metadata_name(text):
+            return text
+    return ""
+
+
+def most_common_entry_metadata_candidate(info: dict[str, object], keys: tuple[str, ...], min_ratio: float = 0.0) -> str:
+    entries = info.get("entries")
+    if not isinstance(entries, list):
+        return ""
+
+    counter: Counter[str] = Counter()
+    original: dict[str, str] = {}
+    for entry in entries[:12]:
+        if not isinstance(entry, dict):
+            continue
+        for key in keys:
+            text = metadata_text(entry.get(key))
+            if not text or is_generic_metadata_name(text):
+                continue
+            normalized = text.casefold()
+            counter[normalized] += 1
+            original.setdefault(normalized, text)
+
+    if not counter:
+        return ""
+    key, count = counter.most_common(1)[0]
+    if min_ratio > 0 and count / max(len(entries[:12]), 1) < min_ratio:
+        return ""
+    return original[key]
+
+
+def looks_like_album(info: dict[str, object], raw_title: object) -> bool:
+    title = str(raw_title or "")
+    if re.match(r"^\s*album\s*[-:]+", title, flags=re.IGNORECASE):
+        return True
+    if top_level_metadata_candidate(info, ("album", "album_title")):
+        return True
+    playlist_type = str(info.get("playlist_type") or info.get("type") or "").lower()
+    if playlist_type == "album":
+        return True
+    common_album = most_common_entry_metadata_candidate(info, ("album", "album_title"), min_ratio=0.75)
+    return bool(common_album and clean_playlist_folder_label(common_album).casefold() == clean_playlist_folder_label(raw_title).casefold())
+
+
+def output_folder_from_playlist_info(info: dict[str, object], url: str) -> Path:
+    raw_title = info.get("playlist_title") or info.get("title") or info.get("album") or fallback_playlist_folder_name(url)
+    album_title = (
+        first_metadata_candidate(info, ("album", "album_title"))
+        or most_common_entry_metadata_candidate(info, ("album", "album_title"))
+        or clean_playlist_folder_label(raw_title)
+    )
+
+    if looks_like_album(info, raw_title):
+        artist = (
+            first_metadata_candidate(info, ("album_artist", "album_artists"))
+            or most_common_entry_metadata_candidate(info, ("album_artist", "album_artists"))
+            or most_common_entry_metadata_candidate(info, ("artist", "artists", "creator", "channel", "uploader"))
+            or first_metadata_candidate(info, ("artist", "artists", "creator", "channel", "uploader"))
+        )
+        artist_folder = sanitize_windows_folder_name(artist or "Unknown Artist", fallback="Unknown Artist")
+        album_folder = sanitize_windows_folder_name(album_title, fallback="Unknown Album")
+        return Path(artist_folder) / album_folder
+
+    return Path(sanitize_windows_folder_name(raw_title))
+
+
+def build_metadata_probe_options(opts: dict[str, object], *, full: bool) -> dict[str, object]:
+    probe_opts = dict(opts)
+    for key in ("outtmpl", "progress_hooks", "postprocessors", "download_archive"):
+        probe_opts.pop(key, None)
+    probe_opts.update({"quiet": True, "noprogress": True, "skip_download": True})
+    if full:
+        probe_opts.pop("extract_flat", None)
+        probe_opts["playlist_items"] = "1:8"
+    else:
+        probe_opts["extract_flat"] = "in_playlist"
+    return probe_opts
+
+
+def merge_playlist_metadata(base: dict[str, object], rich: dict[str, object]) -> dict[str, object]:
+    merged = dict(base)
+    for key, value in rich.items():
+        if key == "entries":
+            continue
+        if value and not merged.get(key):
+            merged[key] = value
+    rich_entries = rich.get("entries")
+    if isinstance(rich_entries, list) and rich_entries:
+        merged["entries"] = rich_entries
+    return merged
+
+
+def resolve_playlist_output_folder(
+    ydl_module: object,
+    opts: dict[str, object],
+    url: str,
+    messages: "queue.Queue[tuple[str, str]]",
+    stop_event: threading.Event,
+) -> Path:
+    if stop_event.is_set():
+        raise DownloadCancelled("Download stopped by user")
+
+    try:
+        with ydl_module.YoutubeDL(build_metadata_probe_options(opts, full=False)) as ydl:
+            info = ydl.extract_info(url, download=False, process=False) or {}
+    except Exception as exc:
+        messages.put(("log", f"Could not pre-read playlist title; using a safe folder name instead: {exc}"))
+        return Path(fallback_playlist_folder_name(url))
+
+    try:
+        with ydl_module.YoutubeDL(build_metadata_probe_options(opts, full=True)) as ydl:
+            rich_info = ydl.extract_info(url, download=False, process=True) or {}
+        info = merge_playlist_metadata(info, rich_info)
+    except Exception as exc:
+        messages.put(("log", f"Could not read full song metadata for album artist; using playlist metadata instead: {exc}"))
+
+    folder = output_folder_from_playlist_info(info, url)
+    messages.put(("log", f"Download folder: {folder}"))
+    return folder
 
 
 def without_browser_cookies(opts: dict[str, object]) -> dict[str, object]:
@@ -281,6 +538,7 @@ def build_ydl_options(
     cookies_mode: str,
     cookies_file: Path | None,
     embed_metadata: bool,
+    normalize_audio: bool,
     skip_downloaded: bool,
     sleep_min: float,
     sleep_max: float,
@@ -289,8 +547,11 @@ def build_ydl_options(
     messages: "queue.Queue[tuple[str, str]]",
     stop_event: threading.Event,
 ) -> dict[str, object]:
+    audio_format = normalize_audio_format(format_choice)
+    preferred_codec = audio_format.lower()
+    preferred_quality = "320" if audio_format == "MP3" else "0"
     postprocessors: list[dict[str, object]] = [
-        {"key": "FFmpegExtractAudio", "preferredcodec": "flac", "preferredquality": "0"}
+        {"key": "FFmpegExtractAudio", "preferredcodec": preferred_codec, "preferredquality": preferred_quality}
     ]
     ydl_format = "bestaudio/best"
 
@@ -327,6 +588,8 @@ def build_ydl_options(
         "logger": QueueLogger(messages),
         "extractor_args": {"youtube": {"player_client": ["default", "web", "web_embedded", "mweb"]}},
     }
+    if normalize_audio:
+        options["postprocessor_args"] = {"extractaudio+ffmpeg_o": ["-af", LOUDNESS_NORMALIZE_FILTER]}
 
     if sleep_min > 0:
         options["sleep_interval"] = sleep_min
@@ -353,6 +616,84 @@ def build_ydl_options(
     return options
 
 
+def queue_worker_process(
+    targets: list[dict[str, str]],
+    output_dir_text: str,
+    settings: dict[str, object],
+    messages: object,
+    stop_event: object,
+    kill_event: object,
+) -> None:
+    output_dir = Path(output_dir_text)
+    try:
+        import yt_dlp
+
+        completed = 0
+        failed = 0
+        for index, target in enumerate(targets, start=1):
+            item_id = target["id"]
+            url = target["url"]
+            if kill_event.is_set():
+                messages.put(("queue_status", {"id": item_id, "status": "Stopped", "detail": "Killed"}))
+                continue
+            if stop_event.is_set():
+                messages.put(("queue_status", {"id": item_id, "status": "Stopped", "detail": "Waiting"}))
+                continue
+
+            messages.put(("queue_status", {"id": item_id, "status": "Downloading", "detail": f"{index}/{len(targets)}"}))
+            messages.put(("log", f"== Playlist {index}/{len(targets)} =="))
+            messages.put(("log", url))
+
+            options = build_ydl_options(
+                output_dir=output_dir,
+                format_choice=str(settings["format_choice"]),
+                cookies_mode=str(settings["cookies_mode"]),
+                cookies_file=Path(str(settings["cookies_file"])) if settings["cookies_file"] else None,
+                embed_metadata=bool(settings["embed_metadata"]),
+                normalize_audio=bool(settings["normalize_audio"]),
+                skip_downloaded=bool(settings["skip_downloaded"]),
+                sleep_min=float(settings["sleep_min"]),
+                sleep_max=float(settings["sleep_max"]),
+                js_runtime=str(settings["js_runtime"]),
+                remote_components=str(settings["remote_components"]),
+                messages=messages,
+                stop_event=stop_event,
+            )
+
+            try:
+                playlist_folder = resolve_playlist_output_folder(yt_dlp, options, url, messages, stop_event)
+                options["outtmpl"] = str(output_dir / playlist_folder / "%(playlist_index)03d - %(title).180B.%(ext)s")
+                result = run_ydl_download_with_retries(yt_dlp, options, url, messages, stop_event)
+            except DownloadCancelled:
+                detail = "Killed; partial files can resume" if kill_event.is_set() else "Partial files can resume"
+                message = "Queue killed. Partial files can be resumed later." if kill_event.is_set() else "Queue stopped by user. Partial files can be resumed later."
+                messages.put(("queue_status", {"id": item_id, "status": "Stopped", "detail": detail}))
+                messages.put(("done", message))
+                return
+            except Exception as exc:
+                failed += 1
+                messages.put(("log", traceback.format_exc()))
+                messages.put(("queue_status", {"id": item_id, "status": "Failed", "detail": str(exc)[:160]}))
+                continue
+
+            if result == 0:
+                completed += 1
+                messages.put(("queue_status", {"id": item_id, "status": "Complete", "detail": "Saved"}))
+            else:
+                failed += 1
+                messages.put(("queue_status", {"id": item_id, "status": "Failed", "detail": "yt-dlp reported errors"}))
+
+        if failed:
+            messages.put(("done", f"Queue finished: {completed} complete, {failed} failed. Check the log above."))
+        else:
+            messages.put(("done", f"Queue complete. Files are in: {output_dir}"))
+    except DownloadCancelled:
+        messages.put(("done", "Queue stopped by user. Partial files can be resumed later."))
+    except Exception as exc:
+        messages.put(("log", traceback.format_exc()))
+        messages.put(("done", f"Queue failed: {exc}"))
+
+
 class DownloaderApp:
     def __init__(self, root: Tk) -> None:
         self.root = root
@@ -361,25 +702,27 @@ class DownloaderApp:
         self.root.minsize(980, 700)
         self.root.configure(bg="#0f172a")
 
-        self.messages: "queue.Queue[tuple[str, object]]" = queue.Queue()
-        self.stop_event = threading.Event()
-        self.kill_event = threading.Event()
+        self.messages: object = multiprocessing.Queue()
+        self.stop_event = multiprocessing.Event()
+        self.kill_event = multiprocessing.Event()
         self.worker: threading.Thread | None = None
+        self.queue_process: multiprocessing.Process | None = None
         self.config = load_config()
         self.playlist_queue: list[dict[str, str]] = []
         self.next_playlist_id = 1
 
         self.url = StringVar(value=str(self.config.get("url", "")))
         self.output_dir = StringVar(value=str(self.config.get("output_dir", DEFAULT_OUTPUT)))
-        self.format_choice = StringVar(value=DEFAULT_FORMAT)
+        self.format_choice = StringVar(value=normalize_audio_format(self.config.get("format", DEFAULT_FORMAT)))
         self.cookies_mode = StringVar(value=str(self.config.get("cookies_mode", "None / public playlist")))
         self.cookies_file = StringVar(value=str(self.config.get("cookies_file", DEFAULT_COOKIES_FILE)))
-        self.extract_browser = StringVar(value=str(self.config.get("extract_browser", "Edge")))
+        self.extract_browser = StringVar(value=str(self.config.get("extract_browser", "Firefox")))
         self.sleep_min = StringVar(value=str(self.config.get("sleep_min", DEFAULT_SLEEP_MIN)))
         self.sleep_max = StringVar(value=str(self.config.get("sleep_max", DEFAULT_SLEEP_MAX)))
         self.js_runtime = StringVar(value=str(self.config.get("js_runtime", default_js_runtime_setting())))
         self.remote_components = StringVar(value=str(self.config.get("remote_components", DEFAULT_REMOTE_COMPONENTS)))
         self.embed_metadata = BooleanVar(value=bool(self.config.get("embed_metadata", True)))
+        self.normalize_audio = BooleanVar(value=bool(self.config.get("normalize_audio", False)))
         self.skip_downloaded = BooleanVar(value=bool(self.config.get("skip_downloaded", True)))
         self.status = StringVar(value="Ready")
         self.queue_summary = StringVar(value="0 playlists queued")
@@ -513,12 +856,13 @@ class DownloaderApp:
         ttk.Button(settings_frame, text="Browse", style="Soft.TButton", command=self._choose_output).grid(row=0, column=2, sticky="ew", padx=(8, 0), pady=5)
 
         ttk.Label(settings_frame, text="Audio format").grid(row=1, column=0, sticky="w", pady=5)
-        ttk.Label(
+        ttk.Combobox(
             settings_frame,
-            text="FLAC output for every downloaded track",
-            foreground="#0f766e",
-            font=("Segoe UI", 9, "bold"),
-        ).grid(row=1, column=1, columnspan=2, sticky="w", pady=5)
+            textvariable=self.format_choice,
+            values=FORMAT_CHOICES,
+            state="readonly",
+        ).grid(row=1, column=1, sticky="ew", pady=5)
+        ttk.Label(settings_frame, text="MP3 saves space; FLAC keeps larger converted files").grid(row=1, column=2, sticky="w", padx=(8, 0), pady=5)
 
         ttk.Label(settings_frame, text="Cookies").grid(row=2, column=0, sticky="w", pady=5)
         ttk.Combobox(
@@ -541,9 +885,17 @@ class DownloaderApp:
         ).grid(row=4, column=1, sticky="ew", pady=5)
         ttk.Button(settings_frame, text="Extract", style="Soft.TButton", command=self._extract_cookies).grid(row=4, column=2, sticky="ew", padx=(8, 0), pady=5)
 
-        ttk.Label(settings_frame, text="Sleep").grid(row=5, column=0, sticky="w", pady=5)
+        ttk.Label(settings_frame, text="Browser helper").grid(row=5, column=0, sticky="w", pady=5)
+        ttk.Button(
+            settings_frame,
+            text="Kill Browser + Extract",
+            style="Soft.TButton",
+            command=self._kill_browser_and_extract_cookies,
+        ).grid(row=5, column=1, columnspan=2, sticky="ew", pady=5)
+
+        ttk.Label(settings_frame, text="Sleep").grid(row=6, column=0, sticky="w", pady=5)
         sleep_frame = ttk.Frame(settings_frame)
-        sleep_frame.grid(row=5, column=1, columnspan=2, sticky="ew", pady=5)
+        sleep_frame.grid(row=6, column=1, columnspan=2, sticky="ew", pady=5)
         sleep_frame.columnconfigure(0, weight=1)
         sleep_frame.columnconfigure(2, weight=1)
         ttk.Entry(sleep_frame, textvariable=self.sleep_min, width=8).grid(row=0, column=0, sticky="ew")
@@ -551,17 +903,18 @@ class DownloaderApp:
         ttk.Entry(sleep_frame, textvariable=self.sleep_max, width=8).grid(row=0, column=2, sticky="ew")
         ttk.Label(sleep_frame, text="seconds").grid(row=0, column=3, padx=(6, 0))
 
-        ttk.Label(settings_frame, text="JS runtime").grid(row=6, column=0, sticky="w", pady=5)
-        ttk.Entry(settings_frame, textvariable=self.js_runtime).grid(row=6, column=1, columnspan=2, sticky="ew", pady=5)
+        ttk.Label(settings_frame, text="JS runtime").grid(row=7, column=0, sticky="w", pady=5)
+        ttk.Entry(settings_frame, textvariable=self.js_runtime).grid(row=7, column=1, columnspan=2, sticky="ew", pady=5)
 
-        ttk.Label(settings_frame, text="Remote components").grid(row=7, column=0, sticky="w", pady=5)
-        ttk.Entry(settings_frame, textvariable=self.remote_components).grid(row=7, column=1, columnspan=2, sticky="ew", pady=5)
+        ttk.Label(settings_frame, text="Remote components").grid(row=8, column=0, sticky="w", pady=5)
+        ttk.Entry(settings_frame, textvariable=self.remote_components).grid(row=8, column=1, columnspan=2, sticky="ew", pady=5)
 
-        ttk.Checkbutton(settings_frame, text="Embed metadata and cover art", variable=self.embed_metadata).grid(row=8, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        ttk.Checkbutton(settings_frame, text="Skip tracks already in archive", variable=self.skip_downloaded).grid(row=9, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(settings_frame, text="Embed metadata and cover art", variable=self.embed_metadata).grid(row=9, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(settings_frame, text="Normalize loudness (MP3 and FLAC)", variable=self.normalize_audio).grid(row=10, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(settings_frame, text="Skip tracks already in archive", variable=self.skip_downloaded).grid(row=11, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
         tools = ttk.Frame(settings_frame)
-        tools.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(14, 0))
+        tools.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(14, 0))
         ttk.Button(tools, text="Check Dependencies", style="Soft.TButton", command=self._check_dependencies).pack(side="left")
         ttk.Button(tools, text="Install / Repair", style="Soft.TButton", command=self._install_dependencies).pack(side="left", padx=(8, 0))
 
@@ -569,7 +922,22 @@ class DownloaderApp:
         log_frame.grid(row=1, column=1, sticky="nsew", pady=(12, 0))
         log_frame.rowconfigure(0, weight=1)
         log_frame.columnconfigure(0, weight=1)
-        self.log_text = ttk.Treeview(log_frame, show="tree", selectmode="browse", style="Queue.Treeview")
+        self.log_text = tk.Text(
+            log_frame,
+            wrap="word",
+            height=12,
+            state="disabled",
+            bg="#111827",
+            fg="#e5e7eb",
+            insertbackground="#e5e7eb",
+            selectbackground="#475569",
+            selectforeground="#ffffff",
+            relief="flat",
+            bd=0,
+            padx=10,
+            pady=8,
+            font=("Consolas", 9),
+        )
         self.log_text.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
@@ -584,11 +952,13 @@ class DownloaderApp:
         self.text_context_menu.add_separator()
         self.text_context_menu.add_command(label="Select All", command=lambda: self._text_context_action("select_all"))
 
-        for widget_class in ("Entry", "TEntry", "TCombobox"):
+        for widget_class in ("Entry", "TEntry", "TCombobox", "Text"):
             self.root.bind_class(widget_class, "<Button-3>", self._show_text_context_menu, add="+")
             self.root.bind_class(widget_class, "<Shift-F10>", self._show_text_context_menu, add="+")
             self.root.bind_class(widget_class, "<Control-a>", self._select_all_text_event, add="+")
             self.root.bind_class(widget_class, "<Control-A>", self._select_all_text_event, add="+")
+            self.root.bind_class(widget_class, "<Control-c>", self._copy_text_event, add="+")
+            self.root.bind_class(widget_class, "<Control-C>", self._copy_text_event, add="+")
 
     def _show_text_context_menu(self, event: tk.Event) -> str:
         widget = event.widget
@@ -599,7 +969,10 @@ class DownloaderApp:
         try:
             widget.focus_set()
             if getattr(event, "num", None) == 3 and not self._has_text_selection(widget):
-                widget.icursor(widget.index(f"@{event.x}"))
+                if isinstance(widget, tk.Text):
+                    widget.mark_set("insert", f"@{event.x},{event.y}")
+                else:
+                    widget.icursor(widget.index(f"@{event.x}"))
         except tk.TclError:
             pass
 
@@ -620,11 +993,30 @@ class DownloaderApp:
             if action == "cut":
                 widget.event_generate("<<Cut>>")
             elif action == "copy":
-                widget.event_generate("<<Copy>>")
+                self._copy_text_widget(widget)
             elif action == "paste":
                 widget.event_generate("<<Paste>>")
             elif action == "select_all":
                 self._select_all_text_widget(widget)
+        except tk.TclError:
+            pass
+
+    def _copy_text_event(self, event: tk.Event) -> str:
+        self._copy_text_widget(event.widget)
+        return "break"
+
+    def _copy_text_widget(self, widget: tk.Widget) -> None:
+        try:
+            if isinstance(widget, tk.Text):
+                if widget.tag_ranges("sel"):
+                    text = widget.get("sel.first", "sel.last")
+                else:
+                    text = widget.get("1.0", "end-1c")
+                if text:
+                    self.root.clipboard_clear()
+                    self.root.clipboard_append(text)
+                return
+            widget.event_generate("<<Copy>>")
         except tk.TclError:
             pass
 
@@ -635,12 +1027,19 @@ class DownloaderApp:
     def _select_all_text_widget(self, widget: tk.Widget) -> None:
         try:
             widget.focus_set()
-            widget.selection_range(0, tk.END)
-            widget.icursor(tk.END)
+            if isinstance(widget, tk.Text):
+                widget.tag_add("sel", "1.0", "end-1c")
+                widget.mark_set("insert", "end-1c")
+                widget.see("insert")
+            else:
+                widget.selection_range(0, tk.END)
+                widget.icursor(tk.END)
         except tk.TclError:
             pass
 
     def _has_text_selection(self, widget: tk.Widget) -> bool:
+        if isinstance(widget, tk.Text):
+            return bool(widget.tag_ranges("sel"))
         try:
             widget.selection_get()
             return True
@@ -801,7 +1200,7 @@ class DownloaderApp:
         if sleep_max < sleep_min:
             sleep_max = sleep_min
         return {
-            "format_choice": DEFAULT_FORMAT,
+            "format_choice": normalize_audio_format(self.format_choice.get()),
             "cookies_mode": self.cookies_mode.get(),
             "cookies_file": self.cookies_file.get().strip(),
             "extract_browser": self.extract_browser.get(),
@@ -810,6 +1209,7 @@ class DownloaderApp:
             "js_runtime": self.js_runtime.get().strip(),
             "remote_components": self.remote_components.get().strip(),
             "embed_metadata": self.embed_metadata.get(),
+            "normalize_audio": self.normalize_audio.get(),
             "skip_downloaded": self.skip_downloaded.get(),
         }
 
@@ -819,7 +1219,7 @@ class DownloaderApp:
             {
                 "url": url if url is not None else self.url.get().strip(),
                 "output_dir": str(output_dir if output_dir is not None else self.output_dir.get()),
-                "format": DEFAULT_FORMAT,
+                "format": settings["format_choice"],
                 "cookies_mode": settings["cookies_mode"],
                 "cookies_file": settings["cookies_file"],
                 "extract_browser": settings["extract_browser"],
@@ -828,6 +1228,7 @@ class DownloaderApp:
                 "js_runtime": settings["js_runtime"],
                 "remote_components": settings["remote_components"],
                 "embed_metadata": settings["embed_metadata"],
+                "normalize_audio": settings["normalize_audio"],
                 "skip_downloaded": settings["skip_downloaded"],
                 "queue": [
                     item["url"]
@@ -838,7 +1239,7 @@ class DownloaderApp:
         )
 
     def _start_background_task(self, target: object, args: tuple[object, ...], allow_kill: bool = False) -> bool:
-        if self.worker and self.worker.is_alive():
+        if self._task_running():
             messagebox.showinfo(APP_TITLE, "A task is already running.")
             return False
         self.stop_event.clear()
@@ -848,6 +1249,29 @@ class DownloaderApp:
         self.kill_button.configure(state="normal" if allow_kill else "disabled")
         self.worker = threading.Thread(target=target, args=args, daemon=True)
         self.worker.start()
+        return True
+
+    def _task_running(self) -> bool:
+        return bool(
+            (self.worker and self.worker.is_alive())
+            or (self.queue_process and self.queue_process.is_alive())
+        )
+
+    def _start_queue_process(self, targets: list[dict[str, str]], output_dir: Path, settings: dict[str, object]) -> bool:
+        if self._task_running():
+            messagebox.showinfo(APP_TITLE, "A task is already running.")
+            return False
+        self.stop_event.clear()
+        self.kill_event.clear()
+        self.download_button.configure(state="disabled")
+        self.stop_button.configure(state="normal")
+        self.kill_button.configure(state="normal")
+        self.queue_process = multiprocessing.Process(
+            target=queue_worker_process,
+            args=(targets, str(output_dir), settings, self.messages, self.stop_event, self.kill_event),
+            daemon=True,
+        )
+        self.queue_process.start()
         return True
 
     def _check_dependencies(self) -> None:
@@ -879,7 +1303,21 @@ class DownloaderApp:
             self.messages.put(("log", traceback.format_exc()))
             self.messages.put(("done", f"Dependency install failed: {exc}"))
 
+    def _ensure_yt_dlp_available(self, action: str) -> bool:
+        if importlib.util.find_spec("yt_dlp") is not None:
+            return True
+        message = (
+            f"yt-dlp is not installed in the Python environment running this app, so it cannot {action}.\n\n"
+            "Run Install / Repair now?"
+        )
+        self._append_log("yt-dlp is missing from this Python environment. Run Install / Repair, or start the app with .\\run_downloader.ps1.")
+        if messagebox.askyesno(APP_TITLE, message):
+            self._install_dependencies()
+        return False
+
     def _extract_cookies(self) -> None:
+        if not self._ensure_yt_dlp_available("extract cookies"):
+            return
         path = Path(self.cookies_file.get().strip() or DEFAULT_COOKIES_FILE).expanduser()
         browser = self.extract_browser.get().strip().lower()
         self.cookies_file.set(str(path))
@@ -888,8 +1326,59 @@ class DownloaderApp:
         self._append_log(f"Extracting cookies from {browser} to {path}...")
         self._start_background_task(self._extract_cookies_worker, (browser, path))
 
+    def _kill_browser_and_extract_cookies(self) -> None:
+        browser = self.extract_browser.get().strip().lower()
+        browser_name = browser.title() if browser else "Browser"
+        process_names = browser_process_names(browser)
+        if not process_names:
+            messagebox.showerror(APP_TITLE, f"I do not know which process to close for: {browser_name}")
+            return
+        if not messagebox.askyesno(
+            APP_TITLE,
+            f"This will force-close {browser_name} before extracting cookies.\n\n"
+            "Any unsaved browser work may be lost. Continue?",
+        ):
+            return
+        if not self._ensure_yt_dlp_available(f"extract cookies after closing {browser_name}"):
+            return
+        path = Path(self.cookies_file.get().strip() or DEFAULT_COOKIES_FILE).expanduser()
+        self.cookies_file.set(str(path))
+        self._save_current_config()
+        self.status.set(f"Closing {browser_name}")
+        self._append_log(f"Killing {browser_name}, then extracting cookies to {path}...")
+        self._start_background_task(self._kill_browser_and_extract_cookies_worker, (browser, process_names, path))
+
+    def _kill_browser_and_extract_cookies_worker(self, browser: str, process_names: list[str], cookies_file: Path) -> None:
+        try:
+            closed_any = False
+            for process_name in process_names:
+                result = subprocess.run(
+                    ["taskkill", "/IM", process_name, "/F", "/T"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                output = strip_ansi(f"{result.stdout}\n{result.stderr}").strip()
+                if output:
+                    self.messages.put(("log", output))
+                if result.returncode == 0:
+                    closed_any = True
+            browser_name = browser.title() if browser else "Browser"
+            if closed_any:
+                self.messages.put(("log", f"{browser_name} was closed. Waiting for the cookie database to unlock..."))
+            else:
+                self.messages.put(("log", f"{browser_name} was not running, or Windows did not allow taskkill. Trying cookie extraction anyway."))
+            time.sleep(2)
+            self._extract_cookies_worker(browser, cookies_file)
+        except Exception as exc:
+            self.messages.put(("log", strip_ansi(traceback.format_exc())))
+            self.messages.put(("done", f"Kill Browser + Extract failed: {strip_ansi(exc)}"))
+
     def _extract_cookies_worker(self, browser: str, cookies_file: Path) -> None:
         try:
+            if importlib.util.find_spec("yt_dlp") is None:
+                self.messages.put(("done", "Cookie extraction failed: yt-dlp is not installed. Run Install / Repair, then try again."))
+                return
             import yt_dlp
 
             cookies_file.parent.mkdir(parents=True, exist_ok=True)
@@ -899,30 +1388,61 @@ class DownloaderApp:
             self.messages.put(("set_cookies_file", str(cookies_file)))
             self.messages.put(("done", f"Saved cookies file: {cookies_file}"))
         except Exception as exc:
-            self.messages.put(("log", traceback.format_exc()))
-            self.messages.put(("done", f"Cookie extraction failed: {exc}. Close the browser and try again."))
+            if is_cookie_decrypt_error(exc):
+                help_text = cookie_decrypt_help(browser)
+                self.messages.put(("log", help_text))
+                self.messages.put(("done", "Cookie extraction failed: Windows DPAPI could not decrypt the browser cookies. See the log for the fix."))
+                return
+            self.messages.put(("log", strip_ansi(traceback.format_exc())))
+            self.messages.put(("done", f"Cookie extraction failed: {strip_ansi(exc)}. Close the browser and try again."))
 
     def _validate_download_settings(self, settings: dict[str, object]) -> bool:
         if importlib.util.find_spec("yt_dlp") is None:
-            messagebox.showerror(APP_TITLE, "yt-dlp is not installed.\n\nClick 'Install / Repair Dependencies' or run .\\run_downloader.ps1")
+            self.status.set("yt-dlp is missing")
+            self._ensure_yt_dlp_available("start the queue")
             return False
         if settings["cookies_mode"] == "cookies.txt file" and not settings["cookies_file"]:
+            self.status.set("Select a cookies file")
+            self._append_log("Cannot start queue: cookie mode is set to cookies.txt file, but no cookies file is selected.")
             messagebox.showerror(APP_TITLE, "Select a cookies.txt file, or choose a browser/none cookie mode.")
             return False
         if not shutil.which("ffmpeg"):
+            self.status.set("FFmpeg is missing")
+            self._append_log("Cannot start queue: FFmpeg is required for MP3/FLAC conversion but was not found on PATH.")
             messagebox.showerror(
                 APP_TITLE,
-                "FFmpeg is required because every downloaded song is converted to FLAC.\n\n"
+                "FFmpeg is required because every downloaded song is converted to MP3 or FLAC.\n\n"
                 "Click 'Install / Repair Dependencies' or install FFmpeg manually.",
             )
             return False
         return True
 
     def _start_queue(self) -> None:
+        try:
+            self._start_queue_checked()
+        except Exception as exc:
+            self.status.set("Start Queue failed")
+            self._append_log(strip_ansi(traceback.format_exc()))
+            messagebox.showerror(APP_TITLE, f"Start Queue failed:\n{strip_ansi(exc)}")
+
+    def _start_queue_checked(self) -> None:
+        self._append_log("Start Queue clicked.")
+        if self.worker and self.worker.is_alive():
+            self.status.set("Another task is running")
+            self._append_log("Cannot start queue: another task is still running.")
+            messagebox.showinfo(APP_TITLE, "A task is already running.")
+            return
+
         if self.url.get().strip():
+            before_count = len(self.playlist_queue)
             self._add_playlist_from_entry()
+            added_count = len(self.playlist_queue) - before_count
+            if added_count:
+                self._append_log(f"Added {added_count} playlist(s) from the URL box.")
 
         if not self.playlist_queue:
+            self.status.set("Queue is empty")
+            self._append_log("Cannot start queue: add at least one playlist first.")
             messagebox.showinfo(APP_TITLE, "Add at least one playlist to the queue first.")
             return
 
@@ -952,13 +1472,16 @@ class DownloaderApp:
             if item["status"] in {"Queued", "Failed", "Stopped"}
         ]
         if not targets:
+            self.status.set("No pending playlists")
+            self._append_log("Cannot start queue: there are no queued, failed, or stopped playlists to run.")
             messagebox.showinfo(APP_TITLE, "There are no pending playlists. Use Clear Done or add another playlist.")
             return
 
         self._save_current_config(output_dir=output_dir)
         self._append_log(f"Starting queue with {len(targets)} playlist(s)...")
         self.status.set("Queue running")
-        self._start_background_task(self._queue_worker, (targets, output_dir, settings), allow_kill=True)
+        if not self._start_queue_process(targets, output_dir, settings):
+            self.status.set("Queue did not start")
 
     def _queue_worker(self, targets: list[dict[str, str]], output_dir: Path, settings: dict[str, object]) -> None:
         try:
@@ -986,6 +1509,7 @@ class DownloaderApp:
                     cookies_mode=str(settings["cookies_mode"]),
                     cookies_file=Path(str(settings["cookies_file"])) if settings["cookies_file"] else None,
                     embed_metadata=bool(settings["embed_metadata"]),
+                    normalize_audio=bool(settings["normalize_audio"]),
                     skip_downloaded=bool(settings["skip_downloaded"]),
                     sleep_min=float(settings["sleep_min"]),
                     sleep_max=float(settings["sleep_max"]),
@@ -996,6 +1520,8 @@ class DownloaderApp:
                 )
 
                 try:
+                    playlist_folder = resolve_playlist_output_folder(yt_dlp, options, url, self.messages, self.stop_event)
+                    options["outtmpl"] = str(output_dir / playlist_folder / "%(playlist_index)03d - %(title).180B.%(ext)s")
                     result = run_ydl_download_with_retries(yt_dlp, options, url, self.messages, self.stop_event)
                 except DownloadCancelled:
                     detail = "Killed; partial files can resume" if self.kill_event.is_set() else "Partial files can resume"
@@ -1035,10 +1561,34 @@ class DownloaderApp:
         self.kill_event.set()
         self.stop_event.set()
         self.status.set("Kill switch engaged...")
-        self._append_log("Kill switch engaged. No further playlists will start.")
+        self._append_log("Kill switch engaged. Terminating active download process...")
+        if self.queue_process and self.queue_process.is_alive():
+            pid = self.queue_process.pid
+            if pid and sys.platform.startswith("win"):
+                result = subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/F", "/T"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                output = strip_ansi(f"{result.stdout}\n{result.stderr}").strip()
+                if output:
+                    self._append_log(output)
+            else:
+                self.queue_process.terminate()
+            self.queue_process.join(timeout=3)
+            if self.queue_process.is_alive():
+                self.queue_process.kill()
+                self.queue_process.join(timeout=2)
+            self.queue_process = None
         for item in self.playlist_queue:
-            if item["status"] in {"Queued", "Failed", "Stopped"}:
+            if item["status"] in {"Queued", "Failed", "Stopped", "Downloading"}:
                 self._set_queue_status(item["id"], "Stopped", "Killed")
+        self.download_button.configure(state="normal")
+        self.stop_button.configure(state="disabled")
+        self.kill_button.configure(state="disabled")
+        self.status.set("Queue killed")
+        self._append_log("Queue killed. Partial files may remain and can usually be resumed later.")
         self._save_current_config()
 
     def _poll_messages(self) -> None:
@@ -1059,23 +1609,42 @@ class DownloaderApp:
                 elif kind == "done":
                     self._append_log(str(text))
                     self.status.set(str(text))
+                    if self.queue_process and not self.queue_process.is_alive():
+                        self.queue_process.join(timeout=0)
+                        self.queue_process = None
                     self.download_button.configure(state="normal")
                     self.stop_button.configure(state="disabled")
                     self.kill_button.configure(state="disabled")
                     self._save_current_config()
         except queue.Empty:
             pass
+        self._check_queue_process_exit()
         self.root.after(150, self._poll_messages)
 
+    def _check_queue_process_exit(self) -> None:
+        if not self.queue_process or self.queue_process.is_alive():
+            return
+        exit_code = self.queue_process.exitcode
+        self.queue_process.join(timeout=0)
+        self.queue_process = None
+        self.download_button.configure(state="normal")
+        self.stop_button.configure(state="disabled")
+        self.kill_button.configure(state="disabled")
+        if self.kill_event.is_set():
+            return
+        if exit_code not in (0, None):
+            self.status.set("Queue process exited")
+            self._append_log(f"Queue process exited unexpectedly with code {exit_code}.")
+
     def _append_log(self, text: str) -> None:
-        text = text.replace("\r", "").strip()
+        text = strip_ansi(text).replace("\r", "").strip()
         if not text:
             return
+        self.log_text.configure(state="normal")
         for line in text.splitlines():
-            self.log_text.insert("", "end", text=line)
-        children = self.log_text.get_children()
-        if children:
-            self.log_text.see(children[-1])
+            self.log_text.insert(tk.END, f"{line}\n")
+        self.log_text.configure(state="disabled")
+        self.log_text.see(tk.END)
 
 
 def print_dependency_status() -> None:
@@ -1092,6 +1661,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    multiprocessing.freeze_support()
     args = build_arg_parser().parse_args()
     if args.check_deps:
         print_dependency_status()

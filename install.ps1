@@ -12,7 +12,16 @@ function Write-Step {
 
 function Test-Command {
     param([string]$Name)
-    return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+    $command = Get-Command $Name -ErrorAction SilentlyContinue
+    if (-not $command) {
+        return $false
+    }
+    $source = [string]$command.Source
+    $lowerName = $Name.ToLowerInvariant()
+    if (($lowerName -eq "python" -or $lowerName -eq "python3") -and $source -like "*\WindowsApps\*") {
+        return $false
+    }
+    return $true
 }
 
 function Invoke-Logged {
@@ -53,6 +62,55 @@ function Install-WithWinget {
     return $true
 }
 
+function Install-PythonWithWinget {
+    if (-not (Test-Command "winget")) {
+        return $false
+    }
+
+    $pythonPackages = @(
+        @{ Id = "Python.Python.3.14"; Name = "Python 3.14" },
+        @{ Id = "Python.Python.3.13"; Name = "Python 3.13" },
+        @{ Id = "Python.Python.3.12"; Name = "Python 3.12" },
+        @{ Id = "Python.Python.3.11"; Name = "Python 3.11" },
+        @{ Id = "Python.Python.3.10"; Name = "Python 3.10" }
+    )
+
+    $attempts = @(
+        @("--exact", "--source", "winget", "--scope", "user"),
+        @("--exact", "--source", "winget"),
+        @("--source", "winget", "--scope", "user"),
+        @("--source", "winget")
+    )
+
+    foreach ($package in $pythonPackages) {
+        foreach ($extraArgs in $attempts) {
+            Write-Step "Installing $($package.Name) with winget"
+            $arguments = @(
+                "install",
+                "--id", $package.Id,
+                "--accept-package-agreements",
+                "--accept-source-agreements"
+            ) + $extraArgs
+
+            Write-Host "> winget $($arguments -join ' ')"
+            & winget @arguments
+            $exitCode = $LASTEXITCODE
+            Refresh-Path
+
+            if ($exitCode -eq 0) {
+                if (Get-PythonCommand) {
+                    return $true
+                }
+                Write-Warning "$($package.Name) install completed, but Python is not visible in this PowerShell session yet."
+            }
+            else {
+                Write-Warning "winget exited with code $exitCode for $($package.Name) using: $($extraArgs -join ' ')"
+            }
+        }
+    }
+
+    return $false
+}
 function Ensure-Chocolatey {
     if (Test-Command "choco") {
         return $true
@@ -104,29 +162,159 @@ function Ensure-Tool {
     }
 }
 
-function Get-Python {
-    if (Test-Command "py") {
-        return @("py", "-3")
+function Ensure-WingetDependency {
+    param(
+        [string]$CommandName,
+        [string]$WingetId,
+        [string]$DisplayName
+    )
+    if (Test-Command $CommandName) {
+        Write-Host "$DisplayName already found: $((Get-Command $CommandName).Source)" -ForegroundColor Green
+        return
     }
-    if (Test-Command "python") {
-        return @("python")
+    try {
+        [void](Install-WithWinget -Id $WingetId -Name $DisplayName)
     }
-    throw "Python was not found. Install Python 3.10+ first."
+    catch {
+        Write-Warning "winget install failed for ${DisplayName}: $($_.Exception.Message)"
+        Write-Warning "Install it manually with: winget install --id $WingetId"
+    }
 }
 
+function Get-PythonVersionText {
+    param([string]$PythonPath)
+    try {
+        $result = & $PythonPath --version 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            return $null
+        }
+        return ($result -join " ")
+    }
+    catch {
+        return $null
+    }
+}
+
+function Test-PythonExecutable {
+    param([string]$PythonPath)
+    if (-not (Test-Path -LiteralPath $PythonPath)) {
+        return $false
+    }
+    return [bool](Get-PythonVersionText $PythonPath)
+}
+
+function Test-PythonExecutableAtLeast {
+    param(
+        [string]$PythonPath,
+        [int]$Major,
+        [int]$Minor
+    )
+    $versionText = Get-PythonVersionText $PythonPath
+    if (-not $versionText) {
+        return $false
+    }
+    if ($versionText -notmatch "Python\s+(\d+)\.(\d+)") {
+        return $false
+    }
+    $foundMajor = [int]$Matches[1]
+    $foundMinor = [int]$Matches[2]
+    return ($foundMajor -gt $Major -or ($foundMajor -eq $Major -and $foundMinor -ge $Minor))
+}
+
+function Get-PythonCommandForVersion {
+    param([int]$Minor)
+
+    if (Test-Command "py") {
+        & py "-3.$Minor" --version *> $null
+        if ($LASTEXITCODE -eq 0) {
+            return @("py", "-3.$Minor")
+        }
+    }
+
+    $folderName = "Python3$Minor"
+    $candidatePaths = @(
+        (Join-Path $env:LocalAppData "Programs\Python\$folderName\python.exe"),
+        (Join-Path $env:ProgramFiles "$folderName\python.exe")
+    )
+    if (${env:ProgramFiles(x86)}) {
+        $candidatePaths += (Join-Path ${env:ProgramFiles(x86)} "$folderName\python.exe")
+    }
+
+    foreach ($candidate in $candidatePaths) {
+        if (Test-PythonExecutableAtLeast -PythonPath $candidate -Major 3 -Minor 10) {
+            return @($candidate)
+        }
+    }
+
+    return $null
+}
+
+function Get-PythonCommand {
+    foreach ($minor in 14, 13, 12, 11, 10) {
+        $command = Get-PythonCommandForVersion -Minor $minor
+        if ($command) {
+            return $command
+        }
+    }
+
+    if (Test-Command "python") {
+        $pythonCommand = (Get-Command "python" -ErrorAction SilentlyContinue).Source
+        if ($pythonCommand -and (Test-PythonExecutableAtLeast -PythonPath $pythonCommand -Major 3 -Minor 10)) {
+            return @($pythonCommand)
+        }
+    }
+
+    return $null
+}
+
+function Ensure-Python {
+    if (Get-PythonCommand) {
+        Write-Host "Python 3.10+ already found." -ForegroundColor Green
+        return
+    }
+
+    if (Install-PythonWithWinget) {
+        return
+    }
+
+    throw "Python 3.10+ could not be installed automatically. Try: winget search --source winget --id Python.Python"
+}
+
+function Get-Python {
+    $python = Get-PythonCommand
+    if ($python) {
+        return $python
+    }
+    throw "Python 3.10+ was not found. Install Python manually, then rerun install.ps1."
+}
 Write-Step "YouTube Music Downloader dependency bootstrap"
+
+Ensure-WingetDependency -CommandName "git" -WingetId "Git.Git" -DisplayName "Git"
+Ensure-WingetDependency -CommandName "node" -WingetId "OpenJS.NodeJS.LTS" -DisplayName "Node.js LTS"
+Ensure-Python
+Ensure-WingetDependency -CommandName "dotnet" -WingetId "Microsoft.DotNet.SDK.10" -DisplayName ".NET SDK 10"
+Ensure-WingetDependency -CommandName "gh" -WingetId "GitHub.cli" -DisplayName "GitHub CLI"
 
 $venvPath = Join-Path $PSScriptRoot ".venv"
 $venvPython = Join-Path $venvPath "Scripts\python.exe"
 
-if (-not (Test-Path $venvPython)) {
-    $pythonCommand = Get-Python
+if ((Test-Path -LiteralPath $venvPython) -and -not (Test-PythonExecutable $venvPython)) {
+    Write-Warning "Existing virtual environment is broken or points to a missing Python install. Recreating .venv."
+    Remove-Item -LiteralPath $venvPath -Recurse -Force
+}
+
+if (-not (Test-Path -LiteralPath $venvPython)) {
+    $pythonCommand = @(Get-Python)
     $pythonExe = $pythonCommand[0]
     $pythonArgs = @()
     if ($pythonCommand.Count -gt 1) {
         $pythonArgs = $pythonCommand[1..($pythonCommand.Count - 1)]
     }
     Invoke-Logged $pythonExe ($pythonArgs + @("-m", "venv", $venvPath))
+}
+
+if (-not (Test-PythonExecutable $venvPython)) {
+    throw "The virtual environment Python is still not usable: $venvPython"
 }
 
 Invoke-Logged $venvPython @("-m", "pip", "install", "-U", "pip")
@@ -143,3 +331,4 @@ Invoke-Logged $venvPython @((Join-Path $PSScriptRoot "youtube_music_playlist_dow
 Write-Host ""
 Write-Host "Done. Start the GUI with:" -ForegroundColor Green
 Write-Host "  .\run_downloader.ps1"
+

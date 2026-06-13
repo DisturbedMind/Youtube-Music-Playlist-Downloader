@@ -10,7 +10,7 @@ Use it only for audio you own, created, have permission to archive, or are other
 
 - Downloads one or more `music.youtube.com` playlists from a queue.
 - Lets you paste multiple playlist URLs, reorder them, remove them, and clear finished items.
-- Downloads the highest available source audio and converts every track to FLAC through FFmpeg.
+- Downloads the highest available source audio and converts every track to MP3 or FLAC through FFmpeg.
 - Can use browser cookies for private playlists, age-gated tracks, or account-specific YouTube Music access.
 - Can extract reusable `youtube-cookies.txt` cookies from a browser.
 - Keeps a `.downloaded-archive.txt` file so repeated runs skip tracks already downloaded.
@@ -57,17 +57,17 @@ Then activate the virtual environment again.
 3. Reorder playlists with `Move Up` and `Move Down` if needed.
 4. Click `Start Queue`.
 5. Use `Stop Queue` to stop after the active yt-dlp step.
-6. Use `Kill Queue` when you want to stop the queue immediately and mark waiting playlists as stopped.
+6. Use `Kill Queue` when you want to terminate the active queue immediately and mark pending/downloading playlists as stopped.
 
 Rows move through `Queued`, `Downloading`, `Complete`, `Failed`, or `Stopped`. Failed and stopped rows can be run again by clicking `Start Queue`.
 
-`Kill Queue` prevents any further playlists from starting and interrupts the active download at the next yt-dlp progress/checkpoint. Partial files are left in place so yt-dlp can resume them later.
+`Kill Queue` terminates the active queue process and its child processes, prevents any further playlists from starting, and marks pending/downloading rows as stopped. Partial files are left in place so yt-dlp can usually resume them later.
 
-## FLAC Output And FFmpeg
+## MP3 / FLAC Output And FFmpeg
 
 FFmpeg is required for:
 
-- FLAC conversion for every downloaded song
+- MP3 or FLAC conversion for every downloaded song
 - embedded cover art
 - embedded metadata
 
@@ -85,26 +85,41 @@ choco install ffmpeg
 
 Restart PowerShell after installing FFmpeg so `ffmpeg.exe` is on `PATH`.
 
-The app always saves songs as `.flac`. FLAC is lossless as an output format, but it cannot improve YouTube Music's source quality; it preserves the downloaded audio as cleanly as possible during conversion.
+Use `MP3` when you want smaller files and better device compatibility; MP3 conversion uses 320 kbps. Use `FLAC` when you prefer larger converted files that avoid another lossy encode step after download. Neither option can improve YouTube Music's original source quality.
+
+The optional `Normalize loudness` checkbox applies FFmpeg loudness normalization during conversion for both MP3 and FLAC. It can make mixed playlists play back at a more even volume. It is off by default because albums may have intentional track-to-track dynamics.
 
 ## Cookies For YouTube Music
 
 Public playlists often work without cookies. For private playlists, Premium account streams, unavailable tracks, or account-specific recommendations, choose one of the browser cookie options in the app:
 
+- `Firefox`
 - `Chrome`
 - `Edge`
-- `Firefox`
 - `Brave`
 - `Opera`
+
+Firefox is the recommended browser for grabbing cookies. Chrome, Edge, Brave, Opera, and Vivaldi are Chromium-based browsers, and on Windows their cookies are protected by DPAPI. DPAPI ties those cookies to the exact Windows user profile that created them. If the downloader is running as Administrator, under a different Windows user, from a service, or from a copied/odd Python environment, yt-dlp may not be able to decrypt those cookies even after the browser is closed.
+
+That is why some users will need to install Firefox just for cookie extraction:
+
+1. Install Firefox.
+2. Open Firefox normally as your Windows user.
+3. Sign in to YouTube Music in Firefox.
+4. Close Firefox completely.
+5. In the downloader, pick `Firefox` under `Extract from`.
+6. Click `Extract Cookies`, or use `Kill Browser + Extract`.
+
+After the app creates `youtube-cookies.txt`, leave `Cookies` set to `cookies.txt file`. You do not need to browse with Firefox every day; it can just be the reliable cookie-export browser.
 
 Recommended GUI flow:
 
 1. Choose a cookies file path, for example `youtube-cookies.txt`.
-2. Pick `Edge`, `Chrome`, or your browser under `Extract from`.
+2. Pick `Firefox` under `Extract from`.
 3. Click `Extract Cookies`.
 4. Leave `Cookies` set to `cookies.txt file`.
 
-Close the browser before extracting if cookie extraction fails. Direct browser cookies are also available, but a reusable cookies file is usually more predictable.
+Close the selected browser before extracting if cookie extraction fails. Direct browser cookies are also available, but a reusable cookies file is usually more predictable.
 
 ## YouTube 403 / Challenge Handling
 
@@ -127,21 +142,36 @@ By default, files are saved under:
 %USERPROFILE%\Downloads\YouTube Music
 ```
 
-The app creates a subfolder named after the playlist and filenames like:
+Normal playlists create a subfolder named after the playlist. The file extension follows your selected audio format:
 
 ```text
-001 - Track Title.flac
-002 - Track Title.flac
+001 - Track Title.mp3
+002 - Track Title.mp3
 ```
+
+Albums are grouped by album artist first, then album title:
+
+```text
+Album Artist
+  Album Title
+    001 - Track Title.mp3
+    002 - Track Title.mp3
+```
+
+That keeps all albums by the same artist under one top-level artist folder.
 
 ## Build A Standalone EXE
 
 Optional, if you want a double-clickable app:
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-python -m pip install pyinstaller
-pyinstaller --onefile --windowed --name "YouTube Music Playlist Downloader" .\youtube_music_playlist_downloader.py
+```cmd
+build_exe.bat
 ```
 
-The EXE will be created in `dist`. FFmpeg still needs to be installed on the machine, unless you package it separately.
+The batch file creates or reuses `.venv`, installs PyInstaller, bundles `yt-dlp`, includes the wolf logo, and writes:
+
+```text
+dist\YouTube Music Playlist Downloader.exe
+```
+
+`install.ps1` is also copied into `dist` so the GUI's `Install / Repair Dependencies` button still has a helper script beside the EXE. FFmpeg is still required on the computer that runs the EXE for audio conversion.
