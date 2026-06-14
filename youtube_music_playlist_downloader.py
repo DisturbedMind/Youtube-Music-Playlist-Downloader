@@ -37,6 +37,7 @@ DEFAULT_SLEEP_MAX = "8"
 DEFAULT_REMOTE_COMPONENTS = "ejs:github"
 AUDIO_SUFFIXES = {".flac", ".mp3"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
+STAGING_LEFTOVER_SUFFIXES = IMAGE_SUFFIXES | {".description", ".json", ".part", ".temp", ".tmp", ".ytdl"}
 
 
 class DownloadCancelled(Exception):
@@ -419,44 +420,6 @@ def merge_playlist_metadata(base: dict[str, object], rich: dict[str, object]) ->
     return merged
 
 
-def cleanup_leftover_thumbnail_files(folder: Path, messages: object) -> None:
-    if not folder.exists() or not folder.is_dir():
-        return
-    removed = 0
-    for path in folder.iterdir():
-        if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
-            continue
-        try:
-            path.unlink()
-            removed += 1
-        except OSError as exc:
-            messages.put(("log", f"Could not remove leftover cover image {path.name}: {exc}"))
-    if removed:
-        messages.put(("log", f"Removed {removed} leftover cover image file(s)."))
-
-
-def snapshot_image_files(root: Path) -> set[Path]:
-    if not root.exists():
-        return set()
-    return {path.resolve() for path in root.rglob("*") if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES}
-
-
-def cleanup_new_thumbnail_files(root: Path, before: set[Path], messages: object) -> None:
-    if not root.exists():
-        return
-    removed = 0
-    for path in snapshot_image_files(root):
-        if path in before:
-            continue
-        try:
-            path.unlink()
-            removed += 1
-        except OSError as exc:
-            messages.put(("log", f"Could not remove leftover cover image {path.name}: {exc}"))
-    if removed:
-        messages.put(("log", f"Removed {removed} leftover cover image file(s)."))
-
-
 def album_staging_folder(output_dir: Path, url: str) -> Path:
     playlist_id = playlist_id_from_url(url) or "album"
     folder = sanitize_windows_folder_name(playlist_id, fallback="album")
@@ -530,14 +493,27 @@ def unique_destination_path(path: Path) -> Path:
     return path.with_name(f"{path.stem} ({int(time.time())}){path.suffix}")
 
 
+def is_safe_album_staging_dir(staging_dir: Path) -> bool:
+    return staging_dir.name not in {"", ".", ".."} and staging_dir.parent.name == "_staging"
+
+
+def is_staging_leftover_file(path: Path) -> bool:
+    if path.suffix.lower() in STAGING_LEFTOVER_SUFFIXES:
+        return True
+    return path.name.lower().endswith((".info.json", ".live_chat.json"))
+
+
 def cleanup_album_staging_area(staging_dir: Path, messages: object, *, remove_non_audio: bool) -> None:
     if not staging_dir.exists():
+        return
+    if not is_safe_album_staging_dir(staging_dir):
+        messages.put(("log", f"Refusing staging cleanup outside an app _staging folder: {staging_dir}"))
         return
 
     removed = 0
     if remove_non_audio:
         for path in sorted(staging_dir.rglob("*"), key=lambda item: len(item.parts), reverse=True):
-            if not path.is_file() or path.suffix.lower() in AUDIO_SUFFIXES:
+            if not path.is_file() or not is_staging_leftover_file(path):
                 continue
             try:
                 path.unlink()
@@ -909,7 +885,6 @@ def queue_worker_process(
 
             playlist_output_dir: Path | None = None
             album_staging_dir: Path | None = None
-            image_snapshot = snapshot_image_files(output_dir)
             try:
                 if is_youtube_music_album_playlist(url):
                     album_staging_dir = album_staging_folder(output_dir, url)
@@ -922,15 +897,10 @@ def queue_worker_process(
                     playlist_output_dir = output_dir / playlist_folder
                     options["outtmpl"] = str(playlist_output_dir / "%(playlist_index)03d - %(title).180B.%(ext)s")
                 result = run_ydl_download_with_retries(yt_dlp, options, url, messages, stop_event)
-                if playlist_output_dir is not None:
-                    cleanup_leftover_thumbnail_files(playlist_output_dir, messages)
                 if album_staging_dir is not None and result == 0:
                     final_album_dir = organize_album_files_from_audio_tags(album_staging_dir, output_dir, messages)
-                    if final_album_dir is not None:
-                        cleanup_leftover_thumbnail_files(final_album_dir, messages)
                 elif album_staging_dir is not None:
                     cleanup_album_staging_area(album_staging_dir, messages, remove_non_audio=False)
-                cleanup_new_thumbnail_files(output_dir, image_snapshot, messages)
             except DownloadCancelled:
                 detail = "Killed; partial files can resume" if kill_event.is_set() else "Partial files can resume"
                 message = "Queue killed. Partial files can be resumed later." if kill_event.is_set() else "Queue stopped by user. Partial files can be resumed later."
@@ -938,9 +908,6 @@ def queue_worker_process(
                 messages.put(("done", message))
                 return
             except Exception as exc:
-                if playlist_output_dir is not None:
-                    cleanup_leftover_thumbnail_files(playlist_output_dir, messages)
-                cleanup_new_thumbnail_files(output_dir, image_snapshot, messages)
                 failed += 1
                 messages.put(("log", traceback.format_exc()))
                 messages.put(("queue_status", {"id": item_id, "status": "Failed", "detail": str(exc)[:160]}))
@@ -1791,7 +1758,6 @@ class DownloaderApp:
 
                 playlist_output_dir: Path | None = None
                 album_staging_dir: Path | None = None
-                image_snapshot = snapshot_image_files(output_dir)
                 try:
                     if is_youtube_music_album_playlist(url):
                         album_staging_dir = album_staging_folder(output_dir, url)
@@ -1804,15 +1770,10 @@ class DownloaderApp:
                         playlist_output_dir = output_dir / playlist_folder
                         options["outtmpl"] = str(playlist_output_dir / "%(playlist_index)03d - %(title).180B.%(ext)s")
                     result = run_ydl_download_with_retries(yt_dlp, options, url, self.messages, self.stop_event)
-                    if playlist_output_dir is not None:
-                        cleanup_leftover_thumbnail_files(playlist_output_dir, self.messages)
                     if album_staging_dir is not None and result == 0:
                         final_album_dir = organize_album_files_from_audio_tags(album_staging_dir, output_dir, self.messages)
-                        if final_album_dir is not None:
-                            cleanup_leftover_thumbnail_files(final_album_dir, self.messages)
                     elif album_staging_dir is not None:
                         cleanup_album_staging_area(album_staging_dir, self.messages, remove_non_audio=False)
-                    cleanup_new_thumbnail_files(output_dir, image_snapshot, self.messages)
                 except DownloadCancelled:
                     detail = "Killed; partial files can resume" if self.kill_event.is_set() else "Partial files can resume"
                     message = "Queue killed. Partial files can be resumed later." if self.kill_event.is_set() else "Queue stopped by user. Partial files can be resumed later."
@@ -1820,9 +1781,6 @@ class DownloaderApp:
                     self.messages.put(("done", message))
                     return
                 except Exception as exc:
-                    if playlist_output_dir is not None:
-                        cleanup_leftover_thumbnail_files(playlist_output_dir, self.messages)
-                    cleanup_new_thumbnail_files(output_dir, image_snapshot, self.messages)
                     failed += 1
                     self.messages.put(("log", traceback.format_exc()))
                     self.messages.put(("queue_status", {"id": item_id, "status": "Failed", "detail": str(exc)[:160]}))

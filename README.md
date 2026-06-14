@@ -160,6 +160,8 @@ Album Artist
 
 That keeps all albums by the same artist under one top-level artist folder.
 
+Cleanup is limited to the app-created `_staging` folder. The downloader must not scan or delete existing artist, album, or playlist folders in your output library.
+
 ## Build A Standalone EXE
 
 Optional, if you want a double-clickable app:
