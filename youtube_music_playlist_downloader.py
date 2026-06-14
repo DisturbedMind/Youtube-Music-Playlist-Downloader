@@ -426,6 +426,29 @@ def album_staging_folder(output_dir: Path, url: str) -> Path:
     return output_dir / "_staging" / folder
 
 
+def cleanup_empty_staging_dirs(output_dir: Path, messages: object) -> None:
+    staging_root = output_dir / "_staging"
+    if not staging_root.exists() or not staging_root.is_dir():
+        return
+
+    removed = 0
+    for folder in sorted((path for path in staging_root.rglob("*") if path.is_dir()), key=lambda item: len(item.parts), reverse=True):
+        try:
+            folder.rmdir()
+            removed += 1
+        except OSError:
+            pass
+
+    try:
+        staging_root.rmdir()
+        removed += 1
+    except OSError:
+        pass
+
+    if removed:
+        messages.put(("log", f"Removed {removed} empty staging folder(s)."))
+
+
 def tag_values_from_audio_file(path: Path, keys: tuple[str, ...]) -> list[str]:
     try:
         from mutagen import File as MutagenFile
@@ -851,6 +874,7 @@ def queue_worker_process(
     try:
         import yt_dlp
 
+        cleanup_empty_staging_dirs(output_dir, messages)
         completed = 0
         failed = 0
         for index, target in enumerate(targets, start=1):
@@ -921,8 +945,10 @@ def queue_worker_process(
                 messages.put(("queue_status", {"id": item_id, "status": "Failed", "detail": "yt-dlp reported errors"}))
 
         if failed:
+            cleanup_empty_staging_dirs(output_dir, messages)
             messages.put(("done", f"Queue finished: {completed} complete, {failed} failed. Check the log above."))
         else:
+            cleanup_empty_staging_dirs(output_dir, messages)
             messages.put(("done", f"Queue complete. Files are in: {output_dir}"))
     except DownloadCancelled:
         messages.put(("done", "Queue stopped by user. Partial files can be resumed later."))
@@ -1724,6 +1750,7 @@ class DownloaderApp:
         try:
             import yt_dlp
 
+            cleanup_empty_staging_dirs(output_dir, self.messages)
             completed = 0
             failed = 0
             for index, target in enumerate(targets, start=1):
@@ -1794,8 +1821,10 @@ class DownloaderApp:
                     self.messages.put(("queue_status", {"id": item_id, "status": "Failed", "detail": "yt-dlp reported errors"}))
 
             if failed:
+                cleanup_empty_staging_dirs(output_dir, self.messages)
                 self.messages.put(("done", f"Queue finished: {completed} complete, {failed} failed. Check the log above."))
             else:
+                cleanup_empty_staging_dirs(output_dir, self.messages)
                 self.messages.put(("done", f"Queue complete. Files are in: {output_dir}"))
         except DownloadCancelled:
             self.messages.put(("done", "Queue stopped by user. Partial files can be resumed later."))
