@@ -20,6 +20,14 @@ Use it only for audio you own, created, have permission to archive, or are other
 
 ## Setup On Windows
 
+Get the project first:
+
+```powershell
+winget install --exact --id Git.Git
+git clone https://github.com/DisturbedMind/Youtube-Music-Playlist-Downloader.git
+cd Youtube-Music-Playlist-Downloader
+```
+
 Fast path:
 
 ```powershell

@@ -68,11 +68,11 @@ function Install-PythonWithWinget {
     }
 
     $pythonPackages = @(
-        @{ Id = "Python.Python.3.14"; Name = "Python 3.14" },
-        @{ Id = "Python.Python.3.13"; Name = "Python 3.13" },
-        @{ Id = "Python.Python.3.12"; Name = "Python 3.12" },
-        @{ Id = "Python.Python.3.11"; Name = "Python 3.11" },
-        @{ Id = "Python.Python.3.10"; Name = "Python 3.10" }
+        @{ Id = "Python.Python.3.14"; Name = "Python 3.14"; Minor = 14 },
+        @{ Id = "Python.Python.3.13"; Name = "Python 3.13"; Minor = 13 },
+        @{ Id = "Python.Python.3.12"; Name = "Python 3.12"; Minor = 12 },
+        @{ Id = "Python.Python.3.11"; Name = "Python 3.11"; Minor = 11 },
+        @{ Id = "Python.Python.3.10"; Name = "Python 3.10"; Minor = 10 }
     )
 
     $attempts = @(
@@ -98,10 +98,10 @@ function Install-PythonWithWinget {
             Refresh-Path
 
             if ($exitCode -eq 0) {
-                if (Get-PythonCommand) {
+                if (Wait-ForPythonCommand -PreferredMinor $package.Minor -TimeoutSeconds 90) {
                     return $true
                 }
-                Write-Warning "$($package.Name) install completed, but Python is not visible in this PowerShell session yet."
+                Write-Warning "$($package.Name) install completed, but Python is still not visible after waiting."
             }
             else {
                 Write-Warning "winget exited with code $exitCode for $($package.Name) using: $($extraArgs -join ' ')"
@@ -263,6 +263,37 @@ function Get-PythonCommand {
             return @($pythonCommand)
         }
     }
+
+    return $null
+}
+
+function Wait-ForPythonCommand {
+    param(
+        [int]$PreferredMinor = 0,
+        [int]$TimeoutSeconds = 90
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        Refresh-Path
+
+        if ($PreferredMinor -gt 0) {
+            $preferred = Get-PythonCommandForVersion -Minor $PreferredMinor
+            if ($preferred) {
+                Write-Host "Python found: $($preferred -join ' ')" -ForegroundColor Green
+                return $preferred
+            }
+        }
+
+        $python = Get-PythonCommand
+        if ($python) {
+            Write-Host "Python found: $($python -join ' ')" -ForegroundColor Green
+            return $python
+        }
+
+        Write-Host "Waiting for Python to appear on PATH or the py launcher..."
+        Start-Sleep -Seconds 3
+    } while ((Get-Date) -lt $deadline)
 
     return $null
 }
