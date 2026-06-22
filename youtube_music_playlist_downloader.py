@@ -426,27 +426,30 @@ def album_staging_folder(output_dir: Path, url: str) -> Path:
     return output_dir / "_staging" / folder
 
 
-def cleanup_empty_staging_dirs(output_dir: Path, messages: object) -> None:
+def purge_staging_root(output_dir: Path, messages: object) -> None:
     staging_root = output_dir / "_staging"
-    if not staging_root.exists() or not staging_root.is_dir():
+    if not staging_root.exists():
+        return
+    if not staging_root.is_dir() or staging_root.name != "_staging":
+        messages.put(("log", f"Refusing to purge unexpected staging path: {staging_root}"))
         return
 
-    removed = 0
-    for folder in sorted((path for path in staging_root.rglob("*") if path.is_dir()), key=lambda item: len(item.parts), reverse=True):
-        try:
-            folder.rmdir()
-            removed += 1
-        except OSError:
-            pass
+    try:
+        resolved_output = output_dir.resolve()
+        resolved_staging = staging_root.resolve()
+    except OSError as exc:
+        messages.put(("log", f"Could not verify staging path before purge: {exc}"))
+        return
+
+    if resolved_staging.parent != resolved_output:
+        messages.put(("log", f"Refusing to purge staging path outside output folder: {staging_root}"))
+        return
 
     try:
-        staging_root.rmdir()
-        removed += 1
-    except OSError:
-        pass
-
-    if removed:
-        messages.put(("log", f"Removed {removed} empty staging folder(s)."))
+        shutil.rmtree(resolved_staging)
+        messages.put(("log", "Purged album staging folder."))
+    except OSError as exc:
+        messages.put(("log", f"Could not purge album staging folder: {exc}"))
 
 
 def tag_values_from_audio_file(path: Path, keys: tuple[str, ...]) -> list[str]:
@@ -874,7 +877,7 @@ def queue_worker_process(
     try:
         import yt_dlp
 
-        cleanup_empty_staging_dirs(output_dir, messages)
+        purge_staging_root(output_dir, messages)
         completed = 0
         failed = 0
         for index, target in enumerate(targets, start=1):
@@ -926,8 +929,8 @@ def queue_worker_process(
                 elif album_staging_dir is not None:
                     cleanup_album_staging_area(album_staging_dir, messages, remove_non_audio=False)
             except DownloadCancelled:
-                detail = "Killed; partial files can resume" if kill_event.is_set() else "Partial files can resume"
-                message = "Queue killed. Partial files can be resumed later." if kill_event.is_set() else "Queue stopped by user. Partial files can be resumed later."
+                detail = "Killed; staging purged" if kill_event.is_set() else "Staging purged"
+                message = "Queue killed. Staging files were purged." if kill_event.is_set() else "Queue stopped by user. Staging files were purged."
                 messages.put(("queue_status", {"id": item_id, "status": "Stopped", "detail": detail}))
                 messages.put(("done", message))
                 return
@@ -936,6 +939,8 @@ def queue_worker_process(
                 messages.put(("log", traceback.format_exc()))
                 messages.put(("queue_status", {"id": item_id, "status": "Failed", "detail": str(exc)[:160]}))
                 continue
+            finally:
+                purge_staging_root(output_dir, messages)
 
             if result == 0:
                 completed += 1
@@ -945,13 +950,13 @@ def queue_worker_process(
                 messages.put(("queue_status", {"id": item_id, "status": "Failed", "detail": "yt-dlp reported errors"}))
 
         if failed:
-            cleanup_empty_staging_dirs(output_dir, messages)
+            purge_staging_root(output_dir, messages)
             messages.put(("done", f"Queue finished: {completed} complete, {failed} failed. Check the log above."))
         else:
-            cleanup_empty_staging_dirs(output_dir, messages)
+            purge_staging_root(output_dir, messages)
             messages.put(("done", f"Queue complete. Files are in: {output_dir}"))
     except DownloadCancelled:
-        messages.put(("done", "Queue stopped by user. Partial files can be resumed later."))
+        messages.put(("done", "Queue stopped by user. Staging files were purged."))
     except Exception as exc:
         messages.put(("log", traceback.format_exc()))
         messages.put(("done", f"Queue failed: {exc}"))
@@ -1750,7 +1755,7 @@ class DownloaderApp:
         try:
             import yt_dlp
 
-            cleanup_empty_staging_dirs(output_dir, self.messages)
+            purge_staging_root(output_dir, self.messages)
             completed = 0
             failed = 0
             for index, target in enumerate(targets, start=1):
@@ -1802,8 +1807,8 @@ class DownloaderApp:
                     elif album_staging_dir is not None:
                         cleanup_album_staging_area(album_staging_dir, self.messages, remove_non_audio=False)
                 except DownloadCancelled:
-                    detail = "Killed; partial files can resume" if self.kill_event.is_set() else "Partial files can resume"
-                    message = "Queue killed. Partial files can be resumed later." if self.kill_event.is_set() else "Queue stopped by user. Partial files can be resumed later."
+                    detail = "Killed; staging purged" if self.kill_event.is_set() else "Staging purged"
+                    message = "Queue killed. Staging files were purged." if self.kill_event.is_set() else "Queue stopped by user. Staging files were purged."
                     self.messages.put(("queue_status", {"id": item_id, "status": "Stopped", "detail": detail}))
                     self.messages.put(("done", message))
                     return
@@ -1812,6 +1817,8 @@ class DownloaderApp:
                     self.messages.put(("log", traceback.format_exc()))
                     self.messages.put(("queue_status", {"id": item_id, "status": "Failed", "detail": str(exc)[:160]}))
                     continue
+                finally:
+                    purge_staging_root(output_dir, self.messages)
 
                 if result == 0:
                     completed += 1
@@ -1821,13 +1828,13 @@ class DownloaderApp:
                     self.messages.put(("queue_status", {"id": item_id, "status": "Failed", "detail": "yt-dlp reported errors"}))
 
             if failed:
-                cleanup_empty_staging_dirs(output_dir, self.messages)
+                purge_staging_root(output_dir, self.messages)
                 self.messages.put(("done", f"Queue finished: {completed} complete, {failed} failed. Check the log above."))
             else:
-                cleanup_empty_staging_dirs(output_dir, self.messages)
+                purge_staging_root(output_dir, self.messages)
                 self.messages.put(("done", f"Queue complete. Files are in: {output_dir}"))
         except DownloadCancelled:
-            self.messages.put(("done", "Queue stopped by user. Partial files can be resumed later."))
+            self.messages.put(("done", "Queue stopped by user. Staging files were purged."))
         except Exception as exc:
             self.messages.put(("log", traceback.format_exc()))
             self.messages.put(("done", f"Queue failed: {exc}"))
