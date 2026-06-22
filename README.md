@@ -87,6 +87,14 @@ winget install Gyan.FFmpeg
 
 or:
 
+If `choco` is not recognized yet, open PowerShell as Administrator and install Chocolatey first:
+
+```powershell
+Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+```
+
+Then install FFmpeg:
+
 ```powershell
 choco install ffmpeg
 ```
@@ -185,3 +193,4 @@ dist\YouTube Music Playlist Downloader.exe
 ```
 
 `install.ps1` is also copied into `dist` so the GUI's `Install / Repair Dependencies` button still has a helper script beside the EXE. FFmpeg is still required on the computer that runs the EXE for audio conversion.
+
