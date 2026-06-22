@@ -158,11 +158,12 @@ By default, files are saved under:
 %USERPROFILE%\Downloads\YouTube Music
 ```
 
-Normal playlists create a subfolder named after the playlist. The file extension follows your selected audio format:
+Normal playlists create a subfolder named after the playlist. Track numbers use two digits through 99, then three digits from 100 onward. The file extension follows your selected audio format:
 
 ```text
-001 - Track Title.mp3
-002 - Track Title.mp3
+01 - Track Title.mp3
+02 - Track Title.mp3
+100 - Track Title.mp3
 ```
 
 YouTube Music albums are downloaded to a temporary staging folder first. After conversion, the app reads the finished audio file tags, groups albums by album artist first, then album title, and cleans the staging area after a successful album download:
@@ -170,8 +171,9 @@ YouTube Music albums are downloaded to a temporary staging folder first. After c
 ```text
 Album Artist
   Album Title
-    001 - Track Title.mp3
-    002 - Track Title.mp3
+    01 - Track Title.mp3
+    02 - Track Title.mp3
+    100 - Track Title.mp3
 ```
 
 That keeps all albums by the same artist under one top-level artist folder.
@@ -193,4 +195,3 @@ dist\YouTube Music Playlist Downloader.exe
 ```
 
 `install.ps1` is also copied into `dist` so the GUI's `Install / Repair Dependencies` button still has a helper script beside the EXE. FFmpeg is still required on the computer that runs the EXE for audio conversion.
-

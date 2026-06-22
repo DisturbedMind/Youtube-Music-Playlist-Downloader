@@ -814,7 +814,7 @@ def build_ydl_options(
 
     options: dict[str, object] = {
         "format": ydl_format,
-        "outtmpl": str(output_dir / "%(playlist_title).180B" / "%(playlist_index)03d - %(title).180B.%(ext)s"),
+        "outtmpl": str(output_dir / "%(playlist_title).180B" / "%(playlist_index)02d - %(title).180B.%(ext)s"),
         "continuedl": True,
         "ignoreerrors": True,
         "noprogress": True,
@@ -917,12 +917,12 @@ def queue_worker_process(
                     album_staging_dir = album_staging_folder(output_dir, url)
                     playlist_output_dir = album_staging_dir
                     ensure_album_metadata_postprocessor(options)
-                    options["outtmpl"] = str(album_staging_dir / "%(playlist_index)03d - %(title).180B.%(ext)s")
+                    options["outtmpl"] = str(album_staging_dir / "%(playlist_index)02d - %(title).180B.%(ext)s")
                     messages.put(("log", "Album playlist detected; downloading to staging before reading audio tags."))
                 else:
                     playlist_folder = resolve_playlist_output_folder(yt_dlp, options, url, messages, stop_event)
                     playlist_output_dir = output_dir / playlist_folder
-                    options["outtmpl"] = str(playlist_output_dir / "%(playlist_index)03d - %(title).180B.%(ext)s")
+                    options["outtmpl"] = str(playlist_output_dir / "%(playlist_index)02d - %(title).180B.%(ext)s")
                 result = run_ydl_download_with_retries(yt_dlp, options, url, messages, stop_event)
                 if album_staging_dir is not None and result == 0:
                     final_album_dir = organize_album_files_from_audio_tags(album_staging_dir, output_dir, messages)
@@ -1795,12 +1795,12 @@ class DownloaderApp:
                         album_staging_dir = album_staging_folder(output_dir, url)
                         playlist_output_dir = album_staging_dir
                         ensure_album_metadata_postprocessor(options)
-                        options["outtmpl"] = str(album_staging_dir / "%(playlist_index)03d - %(title).180B.%(ext)s")
+                        options["outtmpl"] = str(album_staging_dir / "%(playlist_index)02d - %(title).180B.%(ext)s")
                         self.messages.put(("log", "Album playlist detected; downloading to staging before reading audio tags."))
                     else:
                         playlist_folder = resolve_playlist_output_folder(yt_dlp, options, url, self.messages, self.stop_event)
                         playlist_output_dir = output_dir / playlist_folder
-                        options["outtmpl"] = str(playlist_output_dir / "%(playlist_index)03d - %(title).180B.%(ext)s")
+                        options["outtmpl"] = str(playlist_output_dir / "%(playlist_index)02d - %(title).180B.%(ext)s")
                     result = run_ydl_download_with_retries(yt_dlp, options, url, self.messages, self.stop_event)
                     if album_staging_dir is not None and result == 0:
                         final_album_dir = organize_album_files_from_audio_tags(album_staging_dir, output_dir, self.messages)
