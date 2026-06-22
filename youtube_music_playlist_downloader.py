@@ -4,6 +4,7 @@ import argparse
 import importlib.util
 import json
 import multiprocessing
+import os
 import queue
 import re
 import shutil
@@ -445,11 +446,27 @@ def purge_staging_root(output_dir: Path, messages: object) -> None:
         messages.put(("log", f"Refusing to purge staging path outside output folder: {staging_root}"))
         return
 
+    last_error: OSError | None = None
+    for _ in range(10):
+        try:
+            shutil.rmtree(resolved_staging, onerror=make_writable_and_retry)
+            messages.put(("log", "Purged album staging folder."))
+            return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.25)
+
+    if resolved_staging.exists():
+        detail = f": {last_error}" if last_error else ""
+        messages.put(("log", f"Could not purge album staging folder{detail}"))
+
+
+def make_writable_and_retry(function: object, path: str, exc_info: object) -> None:
     try:
-        shutil.rmtree(resolved_staging)
-        messages.put(("log", "Purged album staging folder."))
-    except OSError as exc:
-        messages.put(("log", f"Could not purge album staging folder: {exc}"))
+        os.chmod(path, 0o700)
+        function(path)
+    except OSError:
+        pass
 
 
 def tag_values_from_audio_file(path: Path, keys: tuple[str, ...]) -> list[str]:
@@ -1531,6 +1548,7 @@ class DownloaderApp:
             return False
         self.stop_event.clear()
         self.kill_event.clear()
+        purge_staging_root(output_dir, self.messages)
         self.download_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.kill_button.configure(state="normal")
@@ -1868,6 +1886,7 @@ class DownloaderApp:
                 self.queue_process.kill()
                 self.queue_process.join(timeout=2)
             self.queue_process = None
+        self._purge_current_staging()
         for item in self.playlist_queue:
             if item["status"] in {"Queued", "Failed", "Stopped", "Downloading"}:
                 self._set_queue_status(item["id"], "Stopped", "Killed")
@@ -1875,8 +1894,14 @@ class DownloaderApp:
         self.stop_button.configure(state="disabled")
         self.kill_button.configure(state="disabled")
         self.status.set("Queue killed")
-        self._append_log("Queue killed. Partial files may remain and can usually be resumed later.")
+        self._append_log("Queue killed. Staging folder was purged.")
         self._save_current_config()
+
+    def _purge_current_staging(self) -> None:
+        try:
+            purge_staging_root(Path(self.output_dir.get()), self.messages)
+        except Exception as exc:
+            self._append_log(f"Could not purge staging folder: {exc}")
 
     def _poll_messages(self) -> None:
         try:
@@ -1899,6 +1924,7 @@ class DownloaderApp:
                     if self.queue_process and not self.queue_process.is_alive():
                         self.queue_process.join(timeout=0)
                         self.queue_process = None
+                    self._purge_current_staging()
                     self.download_button.configure(state="normal")
                     self.stop_button.configure(state="disabled")
                     self.kill_button.configure(state="disabled")
@@ -1914,6 +1940,7 @@ class DownloaderApp:
         exit_code = self.queue_process.exitcode
         self.queue_process.join(timeout=0)
         self.queue_process = None
+        self._purge_current_staging()
         self.download_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         self.kill_button.configure(state="disabled")
