@@ -195,3 +195,12 @@ dist\YouTube Music Playlist Downloader.exe
 ```
 
 `install.ps1` is also copied into `dist` so the GUI's `Install / Repair Dependencies` button still has a helper script beside the EXE. FFmpeg is still required on the computer that runs the EXE for audio conversion.
+ <p align="center">
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.x-3776AB?logo=python&logoColor=white">
+  <img alt="Tkinter" src="https://img.shields.io/badge/GUI-Tkinter-0f766e">
+  <img alt="yt-dlp" src="https://img.shields.io/badge/Downloader-yt--dlp-2EA043">
+  <img alt="FFmpeg" src="https://img.shields.io/badge/FFmpeg-required-007808?logo=ffmpeg&logoColor=white">
+  <img alt="Audio" src="https://img.shields.io/badge/Audio-MP3%20%7C%20FLAC-ffc230">
+  <img alt="License" src="https://img.shields.io/badge/License-MIT-blue">
+  <img alt="Platform" src="https://img.shields.io/badge/Platform-Windows-0078D4?logo=windows&logoColor=white">
+</p>
